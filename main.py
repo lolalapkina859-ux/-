@@ -15,11 +15,18 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 SCAN_SECONDS = int(os.getenv("SCAN_INTERVAL_SECONDS", "300"))
 
-# Инструменты и их тикеры в публичных источниках (без API-ключей)
+# Расширенный список инструментов (крипта через Binance, форекс/металлы через yfinance)
 SYMBOLS = {
     "BTC / USDT": {"source": "binance", "ticker": "BTCUSDT"},
+    "ETH / USDT": {"source": "binance", "ticker": "ETHUSDT"},
+    "SOL / USDT": {"source": "binance", "ticker": "SOLUSDT"},
     "XAU / USD": {"source": "yfinance", "ticker": "GC=F"},
     "EUR / USD": {"source": "yfinance", "ticker": "EURUSD=X"},
+    "GBP / USD": {"source": "yfinance", "ticker": "GBPUSD=X"},
+    "USD / JPY": {"source": "yfinance", "ticker": "USDJPY=X"},
+    "USD / CAD": {"source": "yfinance", "ticker": "USDCAD=X"},
+    "NZD / USD": {"source": "yfinance", "ticker": "NZDUSD=X"},
+    "AUD / USD": {"source": "yfinance", "ticker": "AUDUSD=X"},
 }
 last_alerts = set()
 
@@ -33,8 +40,23 @@ def telegram(message):
         log.exception("Telegram delivery failed")
 
 
+def send_daily_briefing():
+    today_str = datetime.now(timezone.utc).strftime("%d %B %Y")
+    briefing = (
+        f"Kozak Trend 📈📉\n"
+        f"📅 {today_str}\n\n"
+        f"⚖️ Новини сьогодні:\n"
+        f"Слідкуйте за календарем волатильності по USD, EUR та XAU.\n\n"
+        f"🎯 Під прицілом сьогодні:\n\n"
+        f"1Д - USD/JPY 📉, XAU/USD 📈\n"
+        f"4h - NZD/USD 📉, USD/CAD 📈\n"
+        f"1h - BTC/USDT 📉, XAU/USD 📉, EUR/USD 📈, GBP/USD 📉\n\n"
+        f"⚡️ Як тільки буде знята ключова ліквідність по цих парах — поговоримо!"
+    )
+    telegram(briefing)
+
+
 def fetch_binance_bars(symbol, interval_str):
-    """Получает свечи с Binance Public API без ключей"""
     intervals_map = {"1h": "1h", "5min": "5m"}
     binance_interval = intervals_map.get(interval_str, "1h")
     
@@ -45,7 +67,6 @@ def fetch_binance_bars(symbol, interval_str):
     
     bars = []
     for row in raw_data:
-        # Binance format: [open_time, open, high, low, close, volume, ...]
         timestamp_sec = int(row[0] / 1000)
         bars.append({
             "timestamp": timestamp_sec,
@@ -59,8 +80,6 @@ def fetch_binance_bars(symbol, interval_str):
 
 
 def fetch_yfinance_bars(ticker_str, interval_str):
-    """Получает свечи через Yahoo Finance (yfinance) без ключей"""
-    # yfinance intervals: 1h -> "1h", 5min -> "5m"
     yf_interval = "1h" if interval_str == "1h" else "5m"
     period = "7d" if yf_interval == "5m" else "60d"
     
@@ -68,13 +87,11 @@ def fetch_yfinance_bars(ticker_str, interval_str):
     if df.empty:
         raise RuntimeError(f"Empty data from yfinance for {ticker_str}")
     
-    # Сбрасываем мультииндекс колонок, если он есть в новых версиях pandas/yfinance
     if hasattr(df.columns, 'levels') and len(df.columns.levels) > 1:
         df.columns = df.columns.get_level_values(0)
 
     bars = []
     for idx, row in df.iterrows():
-        # idx это datetime в UTC или локальном времени
         ts = int(idx.timestamp())
         bars.append({
             "timestamp": ts,
@@ -88,7 +105,7 @@ def fetch_yfinance_bars(ticker_str, interval_str):
 
 
 def scan_once():
-    log.info("--- Starting scan cycle (Free Sources) ---")
+    log.info("--- Starting scan cycle (Extended Pairs) ---")
     for display_symbol, info in SYMBOLS.items():
         try:
             log.info("Fetching bars for %s...", display_symbol)
@@ -112,11 +129,13 @@ def scan_once():
             event = detect_sweep(h1, m5)
             if not event:
                 log.info("%s: no liquidity sweep setup found", display_symbol)
+                time.sleep(2)
                 continue
 
             key = f"{display_symbol}:{event['direction']}:{event['level']:.8f}:{event['bar_time']}"
             if key in last_alerts:
                 log.info("%s: sweep found, but alert already sent", display_symbol)
+                time.sleep(2)
                 continue
             
             last_alerts.add(key)
@@ -126,15 +145,20 @@ def scan_once():
 
             telegram(format_signal(display_symbol, event))
             log.info("ALERT SENT for %s!", display_symbol)
+            time.sleep(3)
         except Exception as exc:
             log.warning("%s: scan failed: %s", display_symbol, exc)
+            time.sleep(3)
     log.info("--- Scan cycle finished ---")
 
 
 def main():
     if not all([TELEGRAM_TOKEN, TELEGRAM_CHAT_ID]):
         raise SystemExit("Missing Telegram env vars.")
-    telegram("Liquidity Hunter FX (Free API-less Edition) started.\nSymbols: BTC/USDT, XAU/USD, EUR/USD.")
+    
+    # Отправляем утренний дайджест при старте
+    send_daily_briefing()
+    
     while True:
         scan_once()
         time.sleep(SCAN_SECONDS)
