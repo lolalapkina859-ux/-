@@ -17,9 +17,13 @@ SCAN_SECONDS = int(os.getenv("SCAN_INTERVAL_SECONDS", "300"))
 BASE_URL = "https://api.twelvedata.com/time_series"
 
 SYMBOLS = {
-    "BTCUSD": os.getenv("TD_SYMBOL_BTCUSD", "BTC/USD"),
-    "XAUUSD": os.getenv("TD_SYMBOL_XAUUSD", "XAU/USD"),
-    "EURUSD": os.getenv("TD_SYMBOL_EURUSD", "EUR/USD"),
+    "BTC/USDT": "BTC/USD",
+    "XAU/USD": "XAU/USD",
+    "EUR/USD": "EUR/USD",
+    "USD/CAD": "USD/CAD",
+    "NZD/USD": "NZD/USD",
+    "AUD/USD": "AUD/USD",
+    "GBP/USD": "GBP/USD",
 }
 last_alerts = set()
 
