@@ -15,7 +15,6 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 SCAN_SECONDS = int(os.getenv("SCAN_INTERVAL_SECONDS", "300"))
 
-# Расширенный список инструментов (крипта через Binance, форекс/металлы через yfinance)
 SYMBOLS = {
     "BTC / USDT": {"source": "binance", "ticker": "BTCUSDT"},
     "ETH / USDT": {"source": "binance", "ticker": "ETHUSDT"},
@@ -28,7 +27,10 @@ SYMBOLS = {
     "NZD / USD": {"source": "yfinance", "ticker": "NZDUSD=X"},
     "AUD / USD": {"source": "yfinance", "ticker": "AUDUSD=X"},
 }
+
 last_alerts = set()
+symbol_cooldown = {}  # Защита от спама: хранит таймстамп последнего алерта по инструменту
+COOLDOWN_SECONDS = 10800  # 3 часа перерыва для конкретной пары
 
 
 def telegram(message):
@@ -59,17 +61,14 @@ def send_daily_briefing():
 def fetch_binance_bars(symbol, interval_str):
     intervals_map = {"1h": "1h", "5min": "5m"}
     binance_interval = intervals_map.get(interval_str, "1h")
-    
     url = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval={binance_interval}&limit=100"
     resp = requests.get(url, timeout=15)
     resp.raise_for_status()
     raw_data = resp.json()
-    
     bars = []
     for row in raw_data:
-        timestamp_sec = int(row[0] / 1000)
         bars.append({
-            "timestamp": timestamp_sec,
+            "timestamp": int(row[0] / 1000),
             "open": float(row[1]),
             "high": float(row[2]),
             "low": float(row[3]),
@@ -82,19 +81,15 @@ def fetch_binance_bars(symbol, interval_str):
 def fetch_yfinance_bars(ticker_str, interval_str):
     yf_interval = "1h" if interval_str == "1h" else "5m"
     period = "7d" if yf_interval == "5m" else "60d"
-    
     df = yf.download(ticker_str, period=period, interval=yf_interval, progress=False)
     if df.empty:
         raise RuntimeError(f"Empty data from yfinance for {ticker_str}")
-    
     if hasattr(df.columns, 'levels') and len(df.columns.levels) > 1:
         df.columns = df.columns.get_level_values(0)
-
     bars = []
     for idx, row in df.iterrows():
-        ts = int(idx.timestamp())
         bars.append({
-            "timestamp": ts,
+            "timestamp": int(idx.timestamp()),
             "open": float(row["Open"]),
             "high": float(row["High"]),
             "low": float(row["Low"]),
@@ -105,9 +100,17 @@ def fetch_yfinance_bars(ticker_str, interval_str):
 
 
 def scan_once():
-    log.info("--- Starting scan cycle (Extended Pairs) ---")
+    log.info("--- Starting scan cycle (Pro Features) ---")
+    current_time = time.time()
+
     for display_symbol, info in SYMBOLS.items():
         try:
+            # Проверка Cooldown (защита от спама)
+            last_alert_time = symbol_cooldown.get(display_symbol, 0)
+            if current_time - last_alert_time < COOLDOWN_SECONDS:
+                log.info("%s is in cooldown period. Skipping...", display_symbol)
+                continue
+
             log.info("Fetching bars for %s...", display_symbol)
             source = info["source"]
             ticker = info["ticker"]
@@ -121,11 +124,6 @@ def scan_once():
                 time.sleep(1)
                 m5 = fetch_yfinance_bars(ticker, "5min")
             
-            last_h1 = h1[-1] if h1 else None
-            if last_h1:
-                dt_str = datetime.fromtimestamp(last_h1["timestamp"], timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-                log.info("%s fetched OK. Last H1 close: %s at %s", display_symbol, last_h1["close"], dt_str)
-
             event = detect_sweep(h1, m5)
             if not event:
                 log.info("%s: no liquidity sweep setup found", display_symbol)
@@ -143,8 +141,11 @@ def scan_once():
                 last_alerts.clear()
                 last_alerts.add(key)
 
+            # Устанавливаем кулдаун для символа
+            symbol_cooldown[display_symbol] = current_time
+
             telegram(format_signal(display_symbol, event))
-            log.info("ALERT SENT for %s!", display_symbol)
+            log.info("PRO ALERT SENT for %s!", display_symbol)
             time.sleep(3)
         except Exception as exc:
             log.warning("%s: scan failed: %s", display_symbol, exc)
@@ -156,7 +157,6 @@ def main():
     if not all([TELEGRAM_TOKEN, TELEGRAM_CHAT_ID]):
         raise SystemExit("Missing Telegram env vars.")
     
-    # Отправляем утренний дайджест при старте
     send_daily_briefing()
     
     while True:
