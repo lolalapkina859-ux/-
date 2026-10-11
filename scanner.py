@@ -59,17 +59,23 @@ def detect_sweep(h1, m5):
     }
 
 def format_signal(symbol, event):
-    # Formats number cleanly (e.g., 83500 or 1.41138)
     target_val = event['target']
     if target_val > 1000:
         target_str = f"{target_val:.0f}"
     else:
         target_str = f"{target_val:.5f}"
 
+    # Подбираем цвет и иконку под направление (красный для шорт, зеленый для лонг)
+    if event['direction'] == "SHORT":
+        dir_block = "🔴📉 SHORT SETUP"
+    else:
+        dir_block = "🟢📈 LONG SETUP"
+
     return (
         f"Kozak Trend 📈📉\n"
         f"📊 {symbol}\n"
         f"⚡️ 1h зняття ключової ліквідності.\n"
+        f"{dir_block}\n\n"
         f"🎯 Target: {target_str}\n\n"
         f"🔴 Не лімітка! Переходимо на 3-15m для пошуку моделі входу."
     )
