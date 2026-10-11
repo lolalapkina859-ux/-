@@ -16,14 +16,11 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 SCAN_SECONDS = int(os.getenv("SCAN_INTERVAL_SECONDS", "300"))
 BASE_URL = "https://api.twelvedata.com/time_series"
 
+# Возвращаем 3 ключевых инструмента, чтобы укладываться в лимиты бесплатного API
 SYMBOLS = {
-    "BTC/USDT": "BTC/USD",
-    "XAU/USD": "XAU/USD",
-    "EUR/USD": "EUR/USD",
-    "USD/CAD": "USD/CAD",
-    "NZD/USD": "NZD/USD",
-    "AUD/USD": "AUD/USD",
-    "GBP/USD": "GBP/USD",
+    "BTC / USDT": "BTC/USD",
+    "XAU / USD": "XAU/USD",
+    "EUR / USD": "EUR/USD",
 }
 last_alerts = set()
 
@@ -69,25 +66,28 @@ def fetch_bars(symbol, interval, outputsize=100):
 
 def scan_once():
     log.info("--- Starting scan cycle ---")
-    for canonical, provider_symbol in SYMBOLS.items():
+    for display_symbol, provider_symbol in SYMBOLS.items():
         try:
-            log.info("Fetching bars for %s (%s)...", canonical, provider_symbol)
+            log.info("Fetching bars for %s...", display_symbol)
             h1 = fetch_bars(provider_symbol, "1h", 100)
+            time.sleep(8)  # Пауза между запросами, чтобы не превысить лимит API (429 Too Many Requests)
             m5 = fetch_bars(provider_symbol, "5min", 100)
             
             last_h1 = h1[-1] if h1 else None
             if last_h1:
                 dt_str = datetime.fromtimestamp(last_h1["timestamp"], timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-                log.info("%s fetched OK. Last H1 close: %s at %s", canonical, last_h1["close"], dt_str)
+                log.info("%s fetched OK. Last H1 close: %s at %s", display_symbol, last_h1["close"], dt_str)
 
             event = detect_sweep(h1, m5)
             if not event:
-                log.info("%s: no liquidity sweep setup found", canonical)
+                log.info("%s: no liquidity sweep setup found", display_symbol)
+                time.sleep(8)
                 continue
 
-            key = f"{canonical}:{event['direction']}:{event['level']:.8f}:{event['bar_time']}"
+            key = f"{display_symbol}:{event['direction']}:{event['level']:.8f}:{event['bar_time']}"
             if key in last_alerts:
-                log.info("%s: sweep found, but alert already sent for this bar", canonical)
+                log.info("%s: sweep found, but alert already sent", display_symbol)
+                time.sleep(8)
                 continue
             
             last_alerts.add(key)
@@ -95,17 +95,19 @@ def scan_once():
                 last_alerts.clear()
                 last_alerts.add(key)
 
-            telegram(format_signal(canonical, event) + "\n\nData: Twelve Data.")
-            log.info("ALERT SENT for %s!", canonical)
+            telegram(format_signal(display_symbol, event))
+            log.info("ALERT SENT for %s!", display_symbol)
+            time.sleep(8)
         except Exception as exc:
-            log.warning("%s (%s): scan failed: %s", canonical, provider_symbol, exc)
+            log.warning("%s: scan failed: %s", display_symbol, exc)
+            time.sleep(10)
     log.info("--- Scan cycle finished ---")
 
 
 def main():
     if not all([API_KEY, TELEGRAM_TOKEN, TELEGRAM_CHAT_ID]):
-        raise SystemExit("Missing env vars. Copy .env.example and fill required values.")
-    telegram("Liquidity Hunter FX started.\nData source: Twelve Data.\nSymbols: BTCUSD, XAUUSD, EURUSD.")
+        raise SystemExit("Missing env vars.")
+    telegram("Liquidity Hunter FX started.\nScanning pairs: BTC / USDT, XAU / USD, EUR / USD.")
     while True:
         scan_once()
         time.sleep(SCAN_SECONDS)
