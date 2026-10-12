@@ -29,8 +29,8 @@ SYMBOLS = {
 }
 
 last_alerts = set()
-symbol_cooldown = {}  # Защита от спама: хранит таймстамп последнего алерта по инструменту
-COOLDOWN_SECONDS = 10800  # 3 часа перерыва для конкретной пары
+symbol_cooldown = {}
+COOLDOWN_SECONDS = 10800  # 3 часа
 
 
 def telegram(message):
@@ -42,26 +42,8 @@ def telegram(message):
         log.exception("Telegram delivery failed")
 
 
-def send_daily_briefing():
-    today_str = datetime.now(timezone.utc).strftime("%d %B %Y")
-    briefing = (
-        f"Kozak Trend 📈📉\n"
-        f"📅 {today_str}\n\n"
-        f"⚖️ Новини сьогодні:\n"
-        f"Слідкуйте за календарем волатильності по USD, EUR та XAU.\n\n"
-        f"🎯 Під прицілом сьогодні:\n\n"
-        f"1Д - USD/JPY 📉, XAU/USD 📈\n"
-        f"4h - NZD/USD 📉, USD/CAD 📈\n"
-        f"1h - BTC/USDT 📉, XAU/USD 📉, EUR/USD 📈, GBP/USD 📉\n\n"
-        f"⚡️ Як тільки буде знята ключова ліквідність по цих парах — поговоримо!"
-    )
-    telegram(briefing)
-
-
 def fetch_binance_bars(symbol, interval_str):
-    intervals_map = {"1h": "1h", "5min": "5m"}
-    binance_interval = intervals_map.get(interval_str, "1h")
-    url = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval={binance_interval}&limit=100"
+    url = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval={interval_str}&limit=100"
     resp = requests.get(url, timeout=15)
     resp.raise_for_status()
     raw_data = resp.json()
@@ -79,8 +61,9 @@ def fetch_binance_bars(symbol, interval_str):
 
 
 def fetch_yfinance_bars(ticker_str, interval_str):
-    yf_interval = "1h" if interval_str == "1h" else "5m"
-    period = "7d" if yf_interval == "5m" else "60d"
+    period = "60d" if interval_str in ["1h", "4h"] else "350d"
+    yf_interval = "1d" if interval_str == "1d" else ("1h" if interval_str == "1h" else "1h")
+    
     df = yf.download(ticker_str, period=period, interval=yf_interval, progress=False)
     if df.empty:
         raise RuntimeError(f"Empty data from yfinance for {ticker_str}")
@@ -100,64 +83,56 @@ def fetch_yfinance_bars(ticker_str, interval_str):
 
 
 def scan_once():
-    log.info("--- Starting scan cycle (Pro Features) ---")
+    log.info("--- Starting scan cycle (Multi-TF: 1D / 4H / 1H) ---")
     current_time = time.time()
 
     for display_symbol, info in SYMBOLS.items():
         try:
-            # Проверка Cooldown (защита от спама)
             last_alert_time = symbol_cooldown.get(display_symbol, 0)
             if current_time - last_alert_time < COOLDOWN_SECONDS:
                 log.info("%s is in cooldown period. Skipping...", display_symbol)
                 continue
 
-            log.info("Fetching bars for %s...", display_symbol)
+            log.info("Fetching multi-TF bars for %s...", display_symbol)
             source = info["source"]
             ticker = info["ticker"]
             
             if source == "binance":
+                d1 = fetch_binance_bars(ticker, "1d")
+                h4 = fetch_binance_bars(ticker, "4h")
                 h1 = fetch_binance_bars(ticker, "1h")
-                time.sleep(1)
-                m5 = fetch_binance_bars(ticker, "5min")
             else:
+                d1 = fetch_yfinance_bars(ticker, "1d")
+                h4 = fetch_yfinance_bars(ticker, "1h") # YF fallback H4 via H1 aggregation
                 h1 = fetch_yfinance_bars(ticker, "1h")
-                time.sleep(1)
-                m5 = fetch_yfinance_bars(ticker, "5min")
             
-            event = detect_sweep(h1, m5)
+            event = detect_sweep(d1, h4, h1)
             if not event:
                 log.info("%s: no liquidity sweep setup found", display_symbol)
-                time.sleep(2)
+                time.sleep(1)
                 continue
 
-            key = f"{display_symbol}:{event['direction']}:{event['level']:.8f}:{event['bar_time']}"
+            key = f"{display_symbol}:{event['tf']}:{event['direction']}:{event['level']:.8f}:{event['bar_time']}"
             if key in last_alerts:
                 log.info("%s: sweep found, but alert already sent", display_symbol)
-                time.sleep(2)
+                time.sleep(1)
                 continue
             
             last_alerts.add(key)
-            if len(last_alerts) > 1000:
-                last_alerts.clear()
-                last_alerts.add(key)
-
-            # Устанавливаем кулдаун для символа
             symbol_cooldown[display_symbol] = current_time
 
             telegram(format_signal(display_symbol, event))
-            log.info("PRO ALERT SENT for %s!", display_symbol)
-            time.sleep(3)
+            log.info("MULTI-TF ALERT SENT for %s (%s)!", display_symbol, event['tf'])
+            time.sleep(2)
         except Exception as exc:
             log.warning("%s: scan failed: %s", display_symbol, exc)
-            time.sleep(3)
+            time.sleep(2)
     log.info("--- Scan cycle finished ---")
 
 
 def main():
     if not all([TELEGRAM_TOKEN, TELEGRAM_CHAT_ID]):
         raise SystemExit("Missing Telegram env vars.")
-    
-    send_daily_briefing()
     
     while True:
         scan_once()
