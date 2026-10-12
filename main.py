@@ -16,10 +16,11 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 SCAN_SECONDS = int(os.getenv("SCAN_INTERVAL_SECONDS", "300"))
 
+# Настраиваем инструменты: крипта через BingX API, форекс/металлы через yfinance
 SYMBOLS = {
-    "BTC / USDT": {"source": "binance", "ticker": "BTCUSDT"},
-    "ETH / USDT": {"source": "binance", "ticker": "ETHUSDT"},
-    "SOL / USDT": {"source": "binance", "ticker": "SOLUSDT"},
+    "BTC / USDT": {"source": "bingx", "ticker": "BTC-USDT"},
+    "ETH / USDT": {"source": "bingx", "ticker": "ETH-USDT"},
+    "SOL / USDT": {"source": "bingx", "ticker": "SOL-USDT"},
     "XAU / USD": {"source": "yfinance", "ticker": "GC=F"},
     "EUR / USD": {"source": "yfinance", "ticker": "EURUSD=X"},
     "GBP / USD": {"source": "yfinance", "ticker": "GBPUSD=X"},
@@ -43,19 +44,28 @@ def telegram(message):
         log.exception("Telegram delivery failed")
 
 
-def fetch_binance_bars(symbol, interval_str):
-    url = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval={interval_str}&limit=100"
+def fetch_bingx_bars(symbol, interval_str):
+    """Получение свечей с публичного API BingX (Spot V1 klines)"""
+    # Конвертируем интервалы в формат BingX
+    interval_map = {"1d": "1d", "4h": "4h", "1h": "60m"}
+    bx_interval = interval_map.get(interval_str, "60m")
+    
+    url = f"https://open-api.bingx.com/openApi/swap/v2/quote/klines?symbol={symbol}&interval={bx_interval}&limit=100"
     resp = requests.get(url, timeout=15)
     resp.raise_for_status()
-    raw_data = resp.json()
+    data = resp.json()
+    
+    if data.get("code") != 0 or not data.get("data"):
+        raise RuntimeError(f"BingX API error for {symbol}: {data}")
+        
     bars = []
-    for row in raw_data:
+    for row in data["data"]:
         bars.append({
-            "timestamp": int(row[0] / 1000),
-            "open": float(row[1]),
-            "high": float(row[2]),
-            "low": float(row[3]),
-            "close": float(row[4]),
+            "timestamp": int(row["time"] / 1000),
+            "open": float(row["open"]),
+            "high": float(row["high"]),
+            "low": float(row["low"]),
+            "close": float(row["close"]),
         })
     bars.sort(key=lambda b: b["timestamp"])
     return bars
@@ -84,7 +94,7 @@ def fetch_yfinance_bars(ticker_str, interval_str):
 
 
 def scan_once():
-    log.info("--- Starting scan cycle (Multi-TF & Tracking) ---")
+    log.info("--- Starting scan cycle (BingX & Multi-TF) ---")
     current_time = time.time()
     current_prices = {}
 
@@ -93,10 +103,9 @@ def scan_once():
             last_alert_time = symbol_cooldown.get(display_symbol, 0)
             if current_time - last_alert_time < COOLDOWN_SECONDS:
                 log.info("%s is in cooldown period. Skipping scan...", display_symbol)
-                # Подтягиваем хотя бы текущую цену для проверки трекинга
                 source = info["source"]
                 ticker = info["ticker"]
-                bars = fetch_binance_bars(ticker, "1h") if source == "binance" else fetch_yfinance_bars(ticker, "1h")
+                bars = fetch_bingx_bars(ticker, "1h") if source == "bingx" else fetch_yfinance_bars(ticker, "1h")
                 if bars:
                     current_prices[display_symbol] = {"high": bars[-1]["high"], "low": bars[-1]["low"], "close": bars[-1]["close"]}
                 continue
@@ -105,16 +114,15 @@ def scan_once():
             source = info["source"]
             ticker = info["ticker"]
             
-            if source == "binance":
-                d1 = fetch_binance_bars(ticker, "1d")
-                h4 = fetch_binance_bars(ticker, "4h")
-                h1 = fetch_binance_bars(ticker, "1h")
+            if source == "bingx":
+                d1 = fetch_bingx_bars(ticker, "1d")
+                h4 = fetch_bingx_bars(ticker, "4h")
+                h1 = fetch_bingx_bars(ticker, "1h")
             else:
                 d1 = fetch_yfinance_bars(ticker, "1d")
                 h4 = fetch_yfinance_bars(ticker, "1h")
                 h1 = fetch_yfinance_bars(ticker, "1h")
             
-            # Сохраняем последние котировки для трекера отработки
             if h1:
                 current_prices[display_symbol] = {"high": h1[-1]["high"], "low": h1[-1]["low"], "close": h1[-1]["close"]}
 
@@ -133,10 +141,8 @@ def scan_once():
             last_alerts.add(key)
             symbol_cooldown[display_symbol] = current_time
 
-            # Отправляем сигнал в Telegram
             telegram(format_signal(display_symbol, event))
 
-            # Сохраняем в базу данных для отслеживания результата
             save_signal(
                 symbol=display_symbol,
                 tf=event['tf'],
@@ -147,13 +153,12 @@ def scan_once():
                 rr_ratio=event['rr_ratio']
             )
 
-            log.info("MULTI-TF ALERT SENT & SAVED for %s (%s)!", display_symbol, event['tf'])
+            log.info("BINGX/MULTI-TF ALERT SENT & SAVED for %s (%s)!", display_symbol, event['tf'])
             time.sleep(2)
         except Exception as exc:
             log.warning("%s: scan failed: %s", display_symbol, exc)
             time.sleep(2)
 
-    # Проверяем отработку открытых сделок по актуальным ценам
     if current_prices:
         check_open_trades(current_prices, telegram)
 
@@ -164,7 +169,6 @@ def main():
     if not all([TELEGRAM_TOKEN, TELEGRAM_CHAT_ID]):
         raise SystemExit("Missing Telegram env vars.")
     
-    # Инициализируем базу данных для статистики
     init_db()
     log.info("Database initialized successfully.")
     
