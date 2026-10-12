@@ -4,7 +4,6 @@ import logging
 import requests
 from datetime import datetime, timezone
 from dotenv import load_dotenv
-import yfinance as yf
 from scanner import detect_sweep, format_signal
 from tracker import init_db, save_signal, check_open_trades
 
@@ -16,18 +15,18 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 SCAN_SECONDS = int(os.getenv("SCAN_INTERVAL_SECONDS", "300"))
 
-# Настраиваем инструменты: крипта через BingX API, форекс/металлы через yfinance
+# Все инструменты (крипта, форекс и металлы) переводим на котировки BingX
 SYMBOLS = {
-    "BTC / USDT": {"source": "bingx", "ticker": "BTC-USDT"},
-    "ETH / USDT": {"source": "bingx", "ticker": "ETH-USDT"},
-    "SOL / USDT": {"source": "bingx", "ticker": "SOL-USDT"},
-    "XAU / USD": {"source": "yfinance", "ticker": "GC=F"},
-    "EUR / USD": {"source": "yfinance", "ticker": "EURUSD=X"},
-    "GBP / USD": {"source": "yfinance", "ticker": "GBPUSD=X"},
-    "USD / JPY": {"source": "yfinance", "ticker": "USDJPY=X"},
-    "USD / CAD": {"source": "yfinance", "ticker": "USDCAD=X"},
-    "NZD / USD": {"source": "yfinance", "ticker": "NZDUSD=X"},
-    "AUD / USD": {"source": "yfinance", "ticker": "AUDUSD=X"},
+    "BTC / USDT": {"ticker": "BTC-USDT"},
+    "ETH / USDT": {"ticker": "ETH-USDT"},
+    "SOL / USDT": {"ticker": "SOL-USDT"},
+    "XAU / USD": {"ticker": "XAU-USDT"},     # Золото на BingX
+    "EUR / USD": {"ticker": "EUR-USD"},     # Форекс на BingX
+    "GBP / USD": {"ticker": "GBP-USD"},     # Форекс на BingX
+    "USD / JPY": {"ticker": "USD-JPY"},     # Форекс на BingX
+    "USD / CAD": {"ticker": "USD-CAD"},     # Форекс на BingX
+    "NZD / USD": {"ticker": "NZD-USD"},     # Форекс на BingX
+    "AUD / USD": {"ticker": "AUD-USD"},     # Форекс на BingX
 }
 
 last_alerts = set()
@@ -45,8 +44,7 @@ def telegram(message):
 
 
 def fetch_bingx_bars(symbol, interval_str):
-    """Получение свечей с публичного API BingX (Spot V1 klines)"""
-    # Конвертируем интервалы в формат BingX
+    """Универсальная функция для получения свечей с публичного API BingX (включая крипту, форекс и металлы)"""
     interval_map = {"1d": "1d", "4h": "4h", "1h": "60m"}
     bx_interval = interval_map.get(interval_str, "60m")
     
@@ -71,57 +69,30 @@ def fetch_bingx_bars(symbol, interval_str):
     return bars
 
 
-def fetch_yfinance_bars(ticker_str, interval_str):
-    period = "60d" if interval_str in ["1h", "4h"] else "350d"
-    yf_interval = "1d" if interval_str == "1d" else "1h"
-    
-    df = yf.download(ticker_str, period=period, interval=yf_interval, progress=False)
-    if df.empty:
-        raise RuntimeError(f"Empty data from yfinance for {ticker_str}")
-    if hasattr(df.columns, 'levels') and len(df.columns.levels) > 1:
-        df.columns = df.columns.get_level_values(0)
-    bars = []
-    for idx, row in df.iterrows():
-        bars.append({
-            "timestamp": int(idx.timestamp()),
-            "open": float(row["Open"]),
-            "high": float(row["High"]),
-            "low": float(row["Low"]),
-            "close": float(row["Close"]),
-        })
-    bars.sort(key=lambda b: b["timestamp"])
-    return bars
-
-
 def scan_once():
-    log.info("--- Starting scan cycle (BingX & Multi-TF) ---")
+    log.info("--- Starting scan cycle (100% BingX Multi-TF) ---")
     current_time = time.time()
     current_prices = {}
 
     for display_symbol, info in SYMBOLS.items():
         try:
             last_alert_time = symbol_cooldown.get(display_symbol, 0)
+            ticker = info["ticker"]
+
             if current_time - last_alert_time < COOLDOWN_SECONDS:
                 log.info("%s is in cooldown period. Skipping scan...", display_symbol)
-                source = info["source"]
-                ticker = info["ticker"]
-                bars = fetch_bingx_bars(ticker, "1h") if source == "bingx" else fetch_yfinance_bars(ticker, "1h")
+                bars = fetch_bingx_bars(ticker, "1h")
                 if bars:
                     current_prices[display_symbol] = {"high": bars[-1]["high"], "low": bars[-1]["low"], "close": bars[-1]["close"]}
                 continue
 
-            log.info("Fetching multi-TF bars for %s...", display_symbol)
-            source = info["source"]
-            ticker = info["ticker"]
+            log.info("Fetching multi-TF bars for %s from BingX...", display_symbol)
             
-            if source == "bingx":
-                d1 = fetch_bingx_bars(ticker, "1d")
-                h4 = fetch_bingx_bars(ticker, "4h")
-                h1 = fetch_bingx_bars(ticker, "1h")
-            else:
-                d1 = fetch_yfinance_bars(ticker, "1d")
-                h4 = fetch_yfinance_bars(ticker, "1h")
-                h1 = fetch_yfinance_bars(ticker, "1h")
+            d1 = fetch_bingx_bars(ticker, "1d")
+            time.sleep(0.5)
+            h4 = fetch_bingx_bars(ticker, "4h")
+            time.sleep(0.5)
+            h1 = fetch_bingx_bars(ticker, "1h")
             
             if h1:
                 current_prices[display_symbol] = {"high": h1[-1]["high"], "low": h1[-1]["low"], "close": h1[-1]["close"]}
@@ -153,11 +124,11 @@ def scan_once():
                 rr_ratio=event['rr_ratio']
             )
 
-            log.info("BINGX/MULTI-TF ALERT SENT & SAVED for %s (%s)!", display_symbol, event['tf'])
-            time.sleep(2)
+            log.info("BINGX 100% ALERT SENT & SAVED for %s (%s)!", display_symbol, event['tf'])
+            time.sleep(1)
         except Exception as exc:
             log.warning("%s: scan failed: %s", display_symbol, exc)
-            time.sleep(2)
+            time.sleep(1)
 
     if current_prices:
         check_open_trades(current_prices, telegram)
