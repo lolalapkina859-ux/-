@@ -15,18 +15,18 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 SCAN_SECONDS = int(os.getenv("SCAN_INTERVAL_SECONDS", "300"))
 
-# Все инструменты на фьючерсах BingX
+# Точные тикеры BingX для крипты (с дефисом) и форекса/металлов (слитно)
 SYMBOLS = {
     "BTC / USDT": {"ticker": "BTC-USDT"},
     "ETH / USDT": {"ticker": "ETH-USDT"},
     "SOL / USDT": {"ticker": "SOL-USDT"},
-    "XAU / USD": {"ticker": "XAU-USDT"},
-    "EUR / USD": {"ticker": "EURUSD-USDT"},
-    "GBP / USD": {"ticker": "GBPUSD-USDT"},
-    "USD / JPY": {"ticker": "USDJPY-USDT"},
-    "USD / CAD": {"ticker": "USDCAD-USDT"},
-    "NZD / USD": {"ticker": "NZDUSD-USDT"},
-    "AUD / USD": {"ticker": "AUDUSD-USDT"},
+    "XAU / USD": {"ticker": "XAUUSD"},
+    "EUR / USD": {"ticker": "EURUSD"},
+    "GBP / USD": {"ticker": "GBPUSD"},
+    "USD / JPY": {"ticker": "USDJPY"},
+    "USD / CAD": {"ticker": "USDCAD"},
+    "NZD / USD": {"ticker": "NZDUSD"},
+    "AUD / USD": {"ticker": "AUDUSD"},
 }
 
 last_alerts = set()
@@ -44,8 +44,7 @@ def telegram(message):
 
 
 def fetch_bingx_bars(symbol, interval_str):
-    """Получение свечей с публичного API BingX с правильными значениями интервалов"""
-    # Исправленный маппинг под требования API BingX: 1h, 4h, 1d
+    """Получение свечей с публичного API BingX Futures"""
     interval_map = {"1d": "1d", "4h": "4h", "1h": "1h"}
     bx_interval = interval_map.get(interval_str, "1h")
     
@@ -71,7 +70,7 @@ def fetch_bingx_bars(symbol, interval_str):
 
 
 def scan_once():
-    log.info("--- Starting scan cycle (100% BingX Futures Fixed) ---")
+    log.info("--- Starting scan cycle (100% BingX Unified) ---")
     current_time = time.time()
     current_prices = {}
 
@@ -125,7 +124,7 @@ def scan_once():
                 rr_ratio=event['rr_ratio']
             )
 
-            log.info("BINGX FUTURES ALERT SENT & SAVED for %s (%s)!", display_symbol, event['tf'])
+            log.info("BINGX UNIFIED ALERT SENT & SAVED for %s (%s)!", display_symbol, event['tf'])
             time.sleep(1)
         except Exception as exc:
             log.warning("%s: scan failed: %s", display_symbol, exc)
