@@ -26,42 +26,55 @@ def detect_sweep(d1_bars, h4_bars, h1_bars):
   direction = None
   level = 0.0
   tf = None
+  current_close = 0.0
+  bar_time = None
 
   # 1. Проверяем старший таймфрейм 1D (снятие дневного пула)
   if d1_curr["high"] > d1_high and d1_curr["close"] < d1_high:
     direction = "SHORT"
     level = d1_high
     tf = "1D"
+    current_close = d1_curr["close"]
+    bar_time = d1_curr["timestamp"]
   elif d1_curr["low"] < d1_low and d1_curr["close"] > d1_low:
     direction = "LONG"
     level = d1_low
     tf = "1D"
+    current_close = d1_curr["close"]
+    bar_time = d1_curr["timestamp"]
 
   # 2. Проверяем 4H
   elif h4_curr["high"] > h4_high and h4_curr["close"] < h4_high:
     direction = "SHORT"
     level = h4_high
     tf = "4H"
+    current_close = h4_curr["close"]
+    bar_time = h4_curr["timestamp"]
   elif h4_curr["low"] < h4_low and h4_curr["close"] > h4_low:
     direction = "LONG"
     level = h4_low
     tf = "4H"
+    current_close = h4_curr["close"]
+    bar_time = h4_curr["timestamp"]
 
   # 3. Проверяем 1H
   elif h1_curr["high"] > h1_high and h1_curr["close"] < h1_high:
     direction = "SHORT"
     level = h1_high
     tf = "1H"
+    current_close = h1_curr["close"]
+    bar_time = h1_curr["timestamp"]
   elif h1_curr["low"] < h1_low and h1_curr["close"] > h1_low:
     direction = "LONG"
     level = h1_low
     tf = "1H"
+    current_close = h1_curr["close"]
+    bar_time = h1_curr["timestamp"]
 
   if not direction:
     return None
 
-  current_close = h1_curr["close"]
-
+  # Расчет стоп-лосса и целей
   if direction == "SHORT":
     stop_loss = level + (level * 0.0035)
     risk = stop_loss - current_close
@@ -82,13 +95,19 @@ def detect_sweep(d1_bars, h4_bars, h1_bars):
       "target_1": target_1,
       "target_2": target_2,
       "rr_ratio": 3.5,
-      "bar_time": h1_curr["timestamp"],
+      "bar_time": bar_time,
   }
 
 
 def format_signal(symbol, event):
-  """Форматирование красивого сообщения для Telegram"""
+  """Форматирование расширенного сообщения с SMC-инструкцией для Telegram"""
   emoji = "🔴" if event["direction"] == "SHORT" else "🟢"
+  action_verb = (
+      "пробоя вниз и закрепа"
+      if event["direction"] == "SHORT"
+      else "пробоя вверх и закрепа"
+  )
+  cisd_type = "+CISD" if event["direction"] == "SHORT" else "-CISD"
 
   msg = (
       f"{emoji} **LIQUIDITY SWEEP ALERT** {emoji}\n\n"
@@ -96,8 +115,12 @@ def format_signal(symbol, event):
       f"⏱ **Таймфрейм:** `{event['tf']}`\n"
       f"📊 **Направление:** `{event['direction']}`\n\n"
       f"📍 **Уровень снятия:** `{event['level']:.5f}`\n"
-      f"🎯 **Вход (Entry):** `{event['entry']:.5f}`\n"
-      f"🛑 **Стоп-лосс (SL):** `{event['stop_loss']:.5f}`\n\n"
+      f"⚡️ **Ключевой уровень структуры ({cisd_type}):** `{event['entry']:.5f}`\n\n"
+      f"📝 **SMC Резюме и Инструкция:**\n"
+      f"⚠️ _Не входите вслепую! Ждем реакции:_ \n"
+      f"• Дождитесь {action_verb} (закрытие M5/M15) уровня `{event['entry']:.5f}`.\n"
+      f"• Входите только после подтверждения структуры.\n\n"
+      f"🛑 **Стоп-лосс (SL):** `{event['stop_loss']:.5f}`\n"
       f"🎯 **T1 (Частичная фиксация / БУ):** `{event['target_1']:.5f}` _(R:R 1.5)_\n"
       f"🚀 **T2 (Глобальная цель):** `{event['target_2']:.5f}` _(R:R 3.5)_\n"
   )
