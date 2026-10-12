@@ -15,18 +15,18 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 SCAN_SECONDS = int(os.getenv("SCAN_INTERVAL_SECONDS", "300"))
 
-# Точные тикеры BingX для крипты (с дефисом) и форекса/металлов (слитно)
+# Точные тикеры под требования API BingX Swap/Futures
 SYMBOLS = {
     "BTC / USDT": {"ticker": "BTC-USDT"},
     "ETH / USDT": {"ticker": "ETH-USDT"},
     "SOL / USDT": {"ticker": "SOL-USDT"},
-    "XAU / USD": {"ticker": "XAUUSD"},
-    "EUR / USD": {"ticker": "EURUSD"},
-    "GBP / USD": {"ticker": "GBPUSD"},
-    "USD / JPY": {"ticker": "USDJPY"},
-    "USD / CAD": {"ticker": "USDCAD"},
-    "NZD / USD": {"ticker": "NZDUSD"},
-    "AUD / USD": {"ticker": "AUDUSD"},
+    "XAU / USD": {"ticker": "GOLD-USDT"},      # Золото на BingX Futures
+    "EUR / USD": {"ticker": "EUR-USDT"},       # Форекс пары
+    "GBP / USD": {"ticker": "GBP-USDT"},
+    "USD / JPY": {"ticker": "USDJPY-USDT"},
+    "USD / CAD": {"ticker": "USDCAD-USDT"},
+    "NZD / USD": {"ticker": "NZDUSD-USDT"},
+    "AUD / USD": {"ticker": "AUDUSD-USDT"},
 }
 
 last_alerts = set()
@@ -70,7 +70,7 @@ def fetch_bingx_bars(symbol, interval_str):
 
 
 def scan_once():
-    log.info("--- Starting scan cycle (100% BingX Unified) ---")
+    log.info("--- Starting scan cycle (100% BingX Futures Corrected) ---")
     current_time = time.time()
     current_prices = {}
 
@@ -124,7 +124,7 @@ def scan_once():
                 rr_ratio=event['rr_ratio']
             )
 
-            log.info("BINGX UNIFIED ALERT SENT & SAVED for %s (%s)!", display_symbol, event['tf'])
+            log.info("BINGX FUTURES ALERT SENT & SAVED for %s (%s)!", display_symbol, event['tf'])
             time.sleep(1)
         except Exception as exc:
             log.warning("%s: scan failed: %s", display_symbol, exc)
