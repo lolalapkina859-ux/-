@@ -16,25 +16,24 @@ def _pivot_low(bars, i, left=2, right=2):
         low <= bars[j]["low"] for j in range(i+1, i+right+1)
     )
 
-def detect_sweep(h1, m5):
-    """Detects 1H liquidity sweep with HTF context and R:R calculation."""
-    if len(h1) < 40:
+def _check_timeframe_sweep(bars, tf_name):
+    if len(bars) < 30:
         return None
     
-    h1_closed = h1[:-1]
+    closed_bars = bars[:-1]
     candidates = []
-    start = max(2, len(h1_closed) - 30)
+    start = max(2, len(closed_bars) - 30)
 
-    for j in range(len(h1_closed) - 1, max(2, len(h1_closed) - 4), -1):
-        sweep_bar = h1_closed[j]
+    for j in range(len(closed_bars) - 1, max(2, len(closed_bars) - 4), -1):
+        sweep_bar = closed_bars[j]
         
         for i in range(start, j - 2):
-            if _pivot_high(h1_closed, i):
-                level = h1_closed[i]["high"]
+            if _pivot_high(closed_bars, i):
+                level = closed_bars[i]["high"]
                 if sweep_bar["high"] > level and sweep_bar["close"] < level:
                     candidates.append(("SHORT", level, sweep_bar))
-            if _pivot_low(h1_closed, i):
-                level = h1_closed[i]["low"]
+            if _pivot_low(closed_bars, i):
+                level = closed_bars[i]["low"]
                 if sweep_bar["low"] < level and sweep_bar["close"] > level:
                     candidates.append(("LONG", level, sweep_bar))
 
@@ -43,40 +42,55 @@ def detect_sweep(h1, m5):
 
     direction, level, sweep_bar = candidates[0]
 
-    # Расчет цели (Target)
+    # Target & Stop Loss calculation
     if direction == "SHORT":
-        targets = [b["low"] for b in h1_closed[-24:-1] if b["low"] < level]
+        targets = [b["low"] for b in closed_bars[-24:-1] if b["low"] < level]
         target = min(targets) if targets else level * 0.99
-        stop_loss = sweep_bar["high"] + (sweep_bar["high"] * 0.0005) # буфер за хай свитпа
+        stop_loss = sweep_bar["high"] + (sweep_bar["high"] * 0.0005)
     else:
-        targets = [b["high"] for b in h1_closed[-24:-1] if b["high"] > level]
+        targets = [b["high"] for b in closed_bars[-24:-1] if b["high"] > level]
         target = max(targets) if targets else level * 1.01
-        stop_loss = sweep_bar["low"] - (sweep_bar["low"] * 0.0005) # буфер за лоу свитпа
+        stop_loss = sweep_bar["low"] - (sweep_bar["low"] * 0.0005)
 
-    # Расчет риска к прибыли (Risk / Reward)
     entry_price = sweep_bar["close"]
     risk = abs(entry_price - stop_loss)
     reward = abs(target - entry_price)
     rr_ratio = round(reward / risk, 1) if risk > 0 else 1.0
 
-    # Оценка контекста старшего таймфрейма (HTF Trend по последним 20 барам)
-    recent_trend_bars = h1_closed[-20:]
-    htf_direction = "BULLISH 📈" if recent_trend_bars[-1]["close"] > recent_trend_bars[0]["close"] else "BEARISH 📉"
-    
-    # Качество сетапа (если направление совпадает с трендом HTF — высокая вероятность)
-    is_trend_aligned = (direction == "LONG" and "BULLISH" in htf_direction) or (direction == "SHORT" and "BEARISH" in htf_direction)
-    quality = "🌟 HIGH PROBABILITY (Trend Aligned)" if is_trend_aligned else "⚠️ COUNTER-TREND SETUP"
-
     return {
+        "tf": tf_name,
         "direction": direction,
         "level": level,
         "target": target,
         "stop_loss": stop_loss,
         "rr_ratio": rr_ratio,
-        "htf_trend": htf_direction,
-        "quality": quality,
         "bar_time": sweep_bar["timestamp"],
     }
+
+def detect_sweep(d1, h4, h1):
+    """Сканирует 1D, 4H и 1H на выбор лучшего свитпа"""
+    # 1. Сначала проверяем 1D (самый приоритетный)
+    sweep_1d = _check_timeframe_sweep(d1, "1D")
+    if sweep_1d:
+        sweep_1d["quality"] = "🏆 MAJOR SETUP (1D Sweep)"
+        return sweep_1d
+
+    # 2. Затем проверяем 4H
+    sweep_4h = _check_timeframe_sweep(h4, "4h")
+    if sweep_4h:
+        sweep_4h["quality"] = "🔥 STRONG SETUP (4h Sweep)"
+        return sweep_4h
+
+    # 3. Затем 1H
+    sweep_1h = _check_timeframe_sweep(h1, "1h")
+    if sweep_1h:
+        recent_trend = h1[:-1][-20:]
+        is_bull = recent_trend[-1]["close"] > recent_trend[0]["close"]
+        aligned = (sweep_1h["direction"] == "LONG" and is_bull) or (sweep_1h["direction"] == "SHORT" and not is_bull)
+        sweep_1h["quality"] = "🌟 HIGH PROBABILITY (Trend Aligned)" if aligned else "⚠️ COUNTER-TREND SETUP"
+        return sweep_1h
+
+    return None
 
 def format_signal(symbol, event):
     target_val = event['target']
@@ -89,17 +103,14 @@ def format_signal(symbol, event):
         target_str = f"{target_val:.5f}"
         sl_str = f"{sl_val:.5f}"
 
-    if event['direction'] == "SHORT":
-        dir_block = "🔴📉 SHORT SETUP"
-    else:
-        dir_block = "🟢📈 LONG SETUP"
+    dir_block = "🔴📉 SHORT SETUP" if event['direction'] == "SHORT" else "🟢📈 LONG SETUP"
+    tf_str = event.get('tf', '1h')
 
     return (
         f"Kozak Trend 📈📉\n"
         f"📊 {symbol}\n"
-        f"⚡️ 1h зняття ключової ліквідності.\n"
+        f"⚡️ [{tf_str}] зняття ключової ліквідності.\n"
         f"{dir_block}\n\n"
-        f"🌐 HTF Trend: {event['htf_trend']}\n"
         f"🎯 Target: {target_str}\n"
         f"🛑 Invalidation (SL): {sl_str}\n"
         f"⚖️ Est. R:R: 1:{event['rr_ratio']}\n"
