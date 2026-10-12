@@ -51,14 +51,14 @@ def detect_sweep(d1_bars, h4_bars, h1_bars):
     current_close = h1_curr["close"]
 
     if direction == "SHORT":
-        stop_loss = level + (level * 0.0035)  тюнинга отступа SL
+        stop_loss = level + (level * 0.0035)  # тюнинг отступа SL
         risk = stop_loss - current_close
         # Две цели: T1 консервативная (R:R ~ 1.5), T2 глобальная (R:R ~ 3.5)
         target_1 = current_close - (risk * 1.5)
         target_2 = current_close - (risk * 3.5)
         rr_ratio = 3.5
     else:  # LONG
-        stop_loss = level - (level * 0.0035)
+        stop_loss = level - (level * 0.0035)  # тюнинг отступа SL
         risk = current_close - stop_loss
         target_1 = current_close + (risk * 1.5)
         target_2 = current_close + (risk * 3.5)
