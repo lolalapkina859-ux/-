@@ -41,18 +41,27 @@ def _check_timeframe_sweep(bars, tf_name):
         return None
 
     direction, level, sweep_bar = candidates[0]
-
-    # Target & Stop Loss calculation
-    if direction == "SHORT":
-        targets = [b["low"] for b in closed_bars[-24:-1] if b["low"] < level]
-        target = min(targets) if targets else level * 0.99
-        stop_loss = sweep_bar["high"] + (sweep_bar["high"] * 0.0005)
-    else:
-        targets = [b["high"] for b in closed_bars[-24:-1] if b["high"] > level]
-        target = max(targets) if targets else level * 1.01
-        stop_loss = sweep_bar["low"] - (sweep_bar["low"] * 0.0005)
-
     entry_price = sweep_bar["close"]
+
+    # Ограничиваем поиск целей и стопов ближайшими разумными границами структуры,
+    # чтобы сетапы не были слишком растянутыми (особенно на 1D/4h)
+    recent_bars = closed_bars[-15:] # Берем только последние 15 баров для адекватных локальных целей
+
+    if direction == "SHORT":
+        targets = [b["low"] for b in recent_bars if b["low"] < level]
+        # Если ближайших локальных целей нет, берем небольшое фиксированное движение (например, 1-1.5%)
+        target = min(targets) if targets else entry_price * 0.99
+        # Разумный стоп-лосс: за хай свитп-свечи с небольшим буфером, но не более 1.5% от цены
+        natural_sl = sweep_bar["high"] + (entry_price * 0.001)
+        max_sl = entry_price * 0.015
+        stop_loss = min(natural_sl, entry_price + max_sl)
+    else:
+        targets = [b["high"] for b in recent_bars if b["high"] > level]
+        target = max(targets) if targets else entry_price * 1.01
+        natural_sl = sweep_bar["low"] - (entry_price * 0.001)
+        max_sl = entry_price * 0.015
+        stop_loss = max(natural_sl, entry_price - max_sl)
+
     risk = abs(entry_price - stop_loss)
     reward = abs(target - entry_price)
     rr_ratio = round(reward / risk, 1) if risk > 0 else 1.0
@@ -69,19 +78,16 @@ def _check_timeframe_sweep(bars, tf_name):
 
 def detect_sweep(d1, h4, h1):
     """Сканирует 1D, 4H и 1H на выбор лучшего свитпа"""
-    # 1. Сначала проверяем 1D (самый приоритетный)
     sweep_1d = _check_timeframe_sweep(d1, "1D")
     if sweep_1d:
         sweep_1d["quality"] = "🏆 MAJOR SETUP (1D Sweep)"
         return sweep_1d
 
-    # 2. Затем проверяем 4H
     sweep_4h = _check_timeframe_sweep(h4, "4h")
     if sweep_4h:
         sweep_4h["quality"] = "🔥 STRONG SETUP (4h Sweep)"
         return sweep_4h
 
-    # 3. Затем 1H
     sweep_1h = _check_timeframe_sweep(h1, "1h")
     if sweep_1h:
         recent_trend = h1[:-1][-20:]
