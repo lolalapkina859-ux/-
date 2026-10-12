@@ -1,125 +1,95 @@
-from datetime import datetime, timezone
+import logging
 
-def _pivot_high(bars, i, left=2, right=2):
-    if i < left or i + right >= len(bars):
-        return False
-    high = bars[i]["high"]
-    return all(high > bars[j]["high"] for j in range(i-left, i)) and all(
-        high >= bars[j]["high"] for j in range(i+1, i+right+1)
-    )
+log = logging.getLogger("liquidity-hunter")
 
-def _pivot_low(bars, i, left=2, right=2):
-    if i < left or i + right >= len(bars):
-        return False
-    low = bars[i]["low"]
-    return all(low < bars[j]["low"] for j in range(i-left, i)) and all(
-        low <= bars[j]["low"] for j in range(i+1, i+right+1)
-    )
-
-def _check_timeframe_sweep(bars, tf_name):
-    if len(bars) < 30:
+def detect_sweep(d1_bars, h4_bars, h1_bars):
+    """
+    Поиск ликвидности (Liquidity Sweep) по нескольким таймфреймам.
+    Возвращает словарь с параметрами сетапа или None.
+    """
+    if not d1_bars or not h4_bars or not h1_bars:
         return None
+
+    # Берем последнюю закрытую / актуальную свечу на H1 для поиска свитпа
+    h1_curr = h1_bars[-1]
+    h1_prev = h1_bars[-2]
     
-    closed_bars = bars[:-1]
-    candidates = []
-    start = max(2, len(closed_bars) - 30)
+    # Берем экстремумы старших таймфреймов для ориентиров ликвидности
+    d1_high = max([b["high"] for b in d1_bars[-20:]])
+    d1_low = min([b["low"] for b in d1_bars[-20:]])
+    
+    h4_high = max([b["high"] for b in h4_bars[-15:]])
+    h4_low = min([b["low"] for b in h4_bars[-15:]])
 
-    for j in range(len(closed_bars) - 1, max(2, len(closed_bars) - 4), -1):
-        sweep_bar = closed_bars[j]
-        
-        for i in range(start, j - 2):
-            if _pivot_high(closed_bars, i):
-                level = closed_bars[i]["high"]
-                if sweep_bar["high"] > level and sweep_bar["close"] < level:
-                    candidates.append(("SHORT", level, sweep_bar))
-            if _pivot_low(closed_bars, i):
-                level = closed_bars[i]["low"]
-                if sweep_bar["low"] < level and sweep_bar["close"] > level:
-                    candidates.append(("LONG", level, sweep_bar))
+    direction = None
+    level = 0.0
+    tf = "1H"
 
-    if not candidates:
+    # Проверка на Bearish Sweep (сняли хай и закрылись ниже)
+    if h1_curr["high"] > h4_high and h1_curr["close"] < h4_high:
+        direction = "SHORT"
+        level = h4_high
+        tf = "4H"
+    elif h1_curr["high"] > d1_high and h1_curr["close"] < d1_high:
+        direction = "SHORT"
+        level = d1_high
+        tf = "1D"
+
+    # Проверка на Bullish Sweep (сняли лоу и закрылись выше)
+    elif h1_curr["low"] < h4_low and h1_curr["close"] > h4_low:
+        direction = "LONG"
+        level = h4_low
+        tf = "4H"
+    elif h1_curr["low"] < d1_low and h1_curr["close"] > d1_low:
+        direction = "LONG"
+        level = d1_low
+        tf = "1D"
+
+    if not direction:
         return None
 
-    direction, level, sweep_bar = candidates[0]
-    entry_price = sweep_bar["close"]
-
-    # Ограничиваем поиск целей и стопов ближайшими разумными границами структуры,
-    # чтобы сетапы не были слишком растянутыми (особенно на 1D/4h)
-    recent_bars = closed_bars[-15:] # Берем только последние 15 баров для адекватных локальных целей
+    current_close = h1_curr["close"]
 
     if direction == "SHORT":
-        targets = [b["low"] for b in recent_bars if b["low"] < level]
-        # Если ближайших локальных целей нет, берем небольшое фиксированное движение (например, 1-1.5%)
-        target = min(targets) if targets else entry_price * 0.99
-        # Разумный стоп-лосс: за хай свитп-свечи с небольшим буфером, но не более 1.5% от цены
-        natural_sl = sweep_bar["high"] + (entry_price * 0.001)
-        max_sl = entry_price * 0.015
-        stop_loss = min(natural_sl, entry_price + max_sl)
-    else:
-        targets = [b["high"] for b in recent_bars if b["high"] > level]
-        target = max(targets) if targets else entry_price * 1.01
-        natural_sl = sweep_bar["low"] - (entry_price * 0.001)
-        max_sl = entry_price * 0.015
-        stop_loss = max(natural_sl, entry_price - max_sl)
-
-    risk = abs(entry_price - stop_loss)
-    reward = abs(target - entry_price)
-    rr_ratio = round(reward / risk, 1) if risk > 0 else 1.0
+        stop_loss = level + (level * 0.0035)  тюнинга отступа SL
+        risk = stop_loss - current_close
+        # Две цели: T1 консервативная (R:R ~ 1.5), T2 глобальная (R:R ~ 3.5)
+        target_1 = current_close - (risk * 1.5)
+        target_2 = current_close - (risk * 3.5)
+        rr_ratio = 3.5
+    else:  # LONG
+        stop_loss = level - (level * 0.0035)
+        risk = current_close - stop_loss
+        target_1 = current_close + (risk * 1.5)
+        target_2 = current_close + (risk * 3.5)
+        rr_ratio = 3.5
 
     return {
-        "tf": tf_name,
         "direction": direction,
+        "tf": tf,
         "level": level,
-        "target": target,
+        "entry": current_close,
         "stop_loss": stop_loss,
+        "target_1": target_1,  # Первая цель для частичной фиксации и перевода в БУ
+        "target_2": target_2,  # Вторая цель для финального тейка
         "rr_ratio": rr_ratio,
-        "bar_time": sweep_bar["timestamp"],
+        "bar_time": h1_curr["timestamp"]
     }
 
-def detect_sweep(d1, h4, h1):
-    """Сканирует 1D, 4H и 1H на выбор лучшего свитпа"""
-    sweep_1d = _check_timeframe_sweep(d1, "1D")
-    if sweep_1d:
-        sweep_1d["quality"] = "🏆 MAJOR SETUP (1D Sweep)"
-        return sweep_1d
-
-    sweep_4h = _check_timeframe_sweep(h4, "4h")
-    if sweep_4h:
-        sweep_4h["quality"] = "🔥 STRONG SETUP (4h Sweep)"
-        return sweep_4h
-
-    sweep_1h = _check_timeframe_sweep(h1, "1h")
-    if sweep_1h:
-        recent_trend = h1[:-1][-20:]
-        is_bull = recent_trend[-1]["close"] > recent_trend[0]["close"]
-        aligned = (sweep_1h["direction"] == "LONG" and is_bull) or (sweep_1h["direction"] == "SHORT" and not is_bull)
-        sweep_1h["quality"] = "🌟 HIGH PROBABILITY (Trend Aligned)" if aligned else "⚠️ COUNTER-TREND SETUP"
-        return sweep_1h
-
-    return None
 
 def format_signal(symbol, event):
-    target_val = event['target']
-    sl_val = event['stop_loss']
+    """Форматирование красивого сообщения для Telegram с двумя целями"""
+    emoji = "🔴" if event["direction"] == "SHORT" else "🟢"
     
-    if target_val > 1000:
-        target_str = f"{target_val:.0f}"
-        sl_str = f"{sl_val:.0f}"
-    else:
-        target_str = f"{target_val:.5f}"
-        sl_str = f"{sl_val:.5f}"
-
-    dir_block = "🔴📉 SHORT SETUP" if event['direction'] == "SHORT" else "🟢📈 LONG SETUP"
-    tf_str = event.get('tf', '1h')
-
-    return (
-        f"Kozak Trend 📈📉\n"
-        f"📊 {symbol}\n"
-        f"⚡️ [{tf_str}] зняття ключової ліквідності.\n"
-        f"{dir_block}\n\n"
-        f"🎯 Target: {target_str}\n"
-        f"🛑 Invalidation (SL): {sl_str}\n"
-        f"⚖️ Est. R:R: 1:{event['rr_ratio']}\n"
-        f"📌 Quality: {event['quality']}\n\n"
-        f"🔴 Не лімітка! Переходимо на 3-15m для пошуку моделі входу."
+    msg = (
+        f"{emoji} **LIQUIDITY SWEEP ALERT** {emoji}\n\n"
+        f"🪙 **Инструмент:** `{symbol}`\n"
+        f"⏱ **Таймфрейм:** `{event['tf']}`\n"
+        f"📊 **Направление:** `{event['direction']}`\n\n"
+        f"📍 **Уровень снятия:** `{event['level']:.5f}`\n"
+        f"🎯 **Вход (Entry):** `{event['entry']:.5f}`\n"
+        f"🛑 **Стоп-лосс (SL):** `{event['stop_loss']:.5f}`\n\n"
+        f"🎯 **T1 (Частичная фиксация / БУ):** `{event['target_1']:.5f}` _(R:R 1.5)_\n"
+        f"🚀 **T2 (Глобальная цель):** `{event['target_2']:.5f}` _(R:R 3.5)_\n"
     )
+    return msg
