@@ -19,7 +19,7 @@ log = logging.getLogger("liquidity-hunter")
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
-SCAN_SECONDS = int(os.getenv("SCAN_INTERVAL_SECONDS", "60"))  # 60 секунд для быстрого отслеживания M5
+SCAN_SECONDS = int(os.getenv("SCAN_INTERVAL_SECONDS", "60"))  # 60 секунд для отслеживания M5
 
 SYMBOLS = {
     # Crypto (BingX)
@@ -148,9 +148,9 @@ def scan_once():
                     if confirmed:
                         log.info(f"⚡️ [{display_symbol}] M5 CONFIRMED! Закрытие {last_m5_close} за уровнем {level}")
                         
-                        # Пересчитываем локальный стоп-лосс под M5/1H фракталы
+                        # Пересчитываем локальный стоп-лосс с учетом буфера на спред
                         opt_sl, opt_t1, opt_t2, opt_rr = optimize_sl_tp_on_confirmation(
-                            direction, last_m5_close, m5, h1
+                            direction, last_m5_close, m5, h1, symbol=display_symbol
                         )
                         if opt_sl:
                             setup["stop_loss"] = opt_sl
