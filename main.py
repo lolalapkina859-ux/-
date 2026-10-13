@@ -5,7 +5,7 @@ import requests
 from datetime import datetime, timezone
 from dotenv import load_dotenv
 import yfinance as yf
-from scanner import detect_sweep, format_signal
+from scanner import detect_sweep, format_signal, format_confirmed_signal
 from tracker import init_db, save_signal, check_open_trades
 
 load_dotenv()
@@ -14,9 +14,8 @@ log = logging.getLogger("liquidity-hunter")
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
-SCAN_SECONDS = int(os.getenv("SCAN_INTERVAL_SECONDS", "300"))
+SCAN_SECONDS = int(os.getenv("SCAN_INTERVAL_SECONDS", "60")) # Рекомендую 60 сек для M5
 
-# Надежная гибридная схема: крипта на BingX, форекс и золото на yfinance
 SYMBOLS = {
     "BTC / USDT": {"source": "bingx", "ticker": "BTC-USDT"},
     "ETH / USDT": {"source": "bingx", "ticker": "ETH-USDT"},
@@ -33,7 +32,10 @@ SYMBOLS = {
 
 last_alerts = set()
 symbol_cooldown = {}
-COOLDOWN_SECONDS = 10800  # 3 часа перерыва для символа
+COOLDOWN_SECONDS = 10800  # 3 часа перерыва после подтвержденного входа
+
+# Ожидающие подтверждения закрепа на M5
+pending_setups = {}
 
 
 def telegram(message):
@@ -46,18 +48,14 @@ def telegram(message):
 
 
 def fetch_bingx_bars(symbol, interval_str):
-    """Получение свечей с публичного API BingX Futures"""
-    interval_map = {"1d": "1d", "4h": "4h", "1h": "1h"}
+    interval_map = {"1d": "1d", "4h": "4h", "1h": "1h", "5m": "5m"}
     bx_interval = interval_map.get(interval_str, "1h")
-    
     url = f"https://open-api.bingx.com/openApi/swap/v2/quote/klines?symbol={symbol}&interval={bx_interval}&limit=100"
     resp = requests.get(url, timeout=15)
     resp.raise_for_status()
     data = resp.json()
-    
     if data.get("code") != 0 or not data.get("data"):
         raise RuntimeError(f"BingX API error for {symbol}: {data}")
-        
     bars = []
     for row in data["data"]:
         bars.append({
@@ -72,8 +70,10 @@ def fetch_bingx_bars(symbol, interval_str):
 
 
 def fetch_yfinance_bars(ticker_str, interval_str):
-    period = "60d" if interval_str in ["1h", "4h"] else "350d"
-    yf_interval = "1d" if interval_str == "1d" else "1h"
+    period_map = {"1d": "350d", "4h": "60d", "1h": "60d", "5m": "7d"}
+    period = period_map.get(interval_str, "60d")
+    
+    yf_interval = "1d" if interval_str == "1d" else ("5m" if interval_str == "5m" else "1h")
     
     df = yf.download(ticker_str, period=period, interval=yf_interval, progress=False)
     if df.empty:
@@ -100,62 +100,93 @@ def scan_once():
 
     for display_symbol, info in SYMBOLS.items():
         try:
-            last_alert_time = symbol_cooldown.get(display_symbol, 0)
             source = info["source"]
             ticker = info["ticker"]
 
-            if current_time - last_alert_time < COOLDOWN_SECONDS:
-                log.info("%s is in cooldown period. Skipping scan...", display_symbol)
-                bars = fetch_bingx_bars(ticker, "1h") if source == "bingx" else fetch_yfinance_bars(ticker, "1h")
-                if bars:
-                    current_prices[display_symbol] = {"high": bars[-1]["high"], "low": bars[-1]["low"], "close": bars[-1]["close"]}
+            # 1. ПРОВЕРКА ПОДТВЕРЖДЕНИЯ НА M5 (Быстрый вход)
+            if display_symbol in pending_setups:
+                log.info("Checking M5 confirmation for %s...", display_symbol)
+                m5 = fetch_bingx_bars(ticker, "5m") if source == "bingx" else fetch_yfinance_bars(ticker, "5m")
+                
+                if m5:
+                    last_m5_close = m5[-1]["close"]
+                    current_prices[display_symbol] = {
+                        "high": m5[-1]["high"],
+                        "low": m5[-1]["low"],
+                        "close": last_m5_close
+                    }
+                    
+                    setup = pending_setups[display_symbol]
+                    level = setup["entry"] # Ключевой уровень (+CISD / -CISD)
+                    direction = setup["direction"]
+
+                    confirmed = False
+                    if direction == "LONG" and last_m5_close > level:
+                        confirmed = True
+                    elif direction == "SHORT" and last_m5_close < level:
+                        confirmed = True
+
+                    if confirmed:
+                        log.info(f"⚡️ [{display_symbol}] M5 CONFIRMED! Закрытие {last_m5_close} за уровнем {level}")
+                        telegram(format_confirmed_signal(display_symbol, setup, last_m5_close))
+                        
+                        save_signal(
+                            symbol=display_symbol,
+                            tf=setup['tf'],
+                            direction=direction,
+                            entry_price=last_m5_close,
+                            stop_loss=setup['stop_loss'],
+                            target=setup['target_2'],
+                            rr_ratio=setup['rr_ratio']
+                        )
+                        
+                        del pending_setups[display_symbol]
+                        symbol_cooldown[display_symbol] = current_time
+                        continue
+
+            # 2. ПОИСК СВИПОВ ПО HTF (1D, 4H, 1H)
+            last_alert_time = symbol_cooldown.get(display_symbol, 0)
+            if current_time - last_alert_time < COOLDOWN_SECONDS or display_symbol in pending_setups:
                 continue
 
-            log.info("Fetching multi-TF bars for %s (%s)...", display_symbol, source)
-            
             if source == "bingx":
                 d1 = fetch_bingx_bars(ticker, "1d")
-                time.sleep(0.3)
+                time.sleep(0.2)
                 h4 = fetch_bingx_bars(ticker, "4h")
-                time.sleep(0.3)
+                time.sleep(0.2)
                 h1 = fetch_bingx_bars(ticker, "1h")
             else:
                 d1 = fetch_yfinance_bars(ticker, "1d")
                 h4 = fetch_yfinance_bars(ticker, "1h")
                 h1 = fetch_yfinance_bars(ticker, "1h")
-            
-            if h1:
-                current_prices[display_symbol] = {"high": h1[-1]["high"], "low": h1[-1]["low"], "close": h1[-1]["close"]}
 
-            event = detect_sweep(d1, h4, h1)
+            if h1 and display_symbol not in current_prices:
+                current_prices[display_symbol] = {
+                    "high": h1[-1]["high"],
+                    "low": h1[-1]["low"],
+                    "close": h1[-1]["close"]
+                }
+
+            event = detect_sweep(d1, h4, h1, display_symbol)
             if not event:
-                log.info("%s: no liquidity sweep setup found", display_symbol)
-                time.sleep(0.3)
+                time.sleep(0.2)
                 continue
 
             key = f"{display_symbol}:{event['tf']}:{event['direction']}:{event['level']:.8f}:{event['bar_time']}"
             if key in last_alerts:
-                log.info("%s: sweep found, but alert already sent", display_symbol)
-                time.sleep(0.3)
+                time.sleep(0.2)
                 continue
-            
-            last_alerts.add(key)
-            symbol_cooldown[display_symbol] = current_time
 
+            last_alerts.add(key)
+            
+            # Отправляем первичный алерт о свипе
             telegram(format_signal(display_symbol, event))
 
-            save_signal(
-                symbol=display_symbol,
-                tf=event['tf'],
-                direction=event['direction'],
-                entry_price=event['level'],
-                stop_loss=event['stop_loss'],
-                target=event['target'],
-                rr_ratio=event['rr_ratio']
-            )
+            # Переводим сетап в режим ожидания M5-закрепа
+            pending_setups[display_symbol] = event
+            log.info(f"⏳ [{display_symbol}] Свип обнаружен. Ожидаем закрепления на M5...")
 
-            log.info("HYBRID ALERT SENT & SAVED for %s (%s)!", display_symbol, event['tf'])
-            time.sleep(0.5)
+            time.sleep(0.3)
         except Exception as exc:
             log.warning("%s: scan failed: %s", display_symbol, exc)
             time.sleep(0.3)
