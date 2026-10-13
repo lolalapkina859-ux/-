@@ -76,7 +76,7 @@ def detect_sweep(d1_bars, h4_bars, h1_bars, symbol="UNKNOWN"):
         f"Таймфрейм: {tf} | Направление: {direction} | Уровень: {level:.5f} | Закрытие: {current_close:.5f}"
     )
 
-    # Первичный расчет стопа для превью (пока идет ожидание закрепа)
+    # Первичный расчет стопа для превью
     if direction == "SHORT":
         stop_loss = level + (level * 0.0035)
         risk = stop_loss - current_close
@@ -101,34 +101,40 @@ def detect_sweep(d1_bars, h4_bars, h1_bars, symbol="UNKNOWN"):
     }
 
 
-def optimize_sl_tp_on_confirmation(direction, current_price, m5_bars, h1_bars):
+def optimize_sl_tp_on_confirmation(direction, current_price, m5_bars, h1_bars, symbol="UNKNOWN"):
     """
-    Пересчитывает стоп-лосс за локальный минимум/максимум M5 или 1H при подтверждении закрепа.
-    Это убирает гигантские дневные стопы и дает отличный R:R.
+    Пересчитывает стоп-лосс за M5/1H с учетом запаса на форекс-спред и комиссию.
     """
     try:
+        # Проверяем, является ли инструмент форекс-парой (не крипта и не золото/индексы с жестким спредом)
+        is_forex = any(pair in symbol for pair in ["EUR", "GBP", "USD", "AUD", "NZD", "CAD", "JPY"]) and "USDT" not in symbol
+        
+        # Увеличенный буфер для форекса (защита от расширения спреда), меньше для крипты
+        buffer_pct = 0.0015 if is_forex else 0.0008
+
         if direction == "LONG":
-            # Ищем локальный минимум за последние свечи M5
             local_low = min([b["low"] for b in m5_bars[-8:]])
-            stop_loss = local_low * 0.9995  # Небольшой буфер под тень
+            stop_loss = local_low * (1.0 - buffer_pct)
             risk = current_price - stop_loss
             
-            # Если M5 стоп слишком близко или некорректен, берем 1H минимум
-            if risk <= 0 or (risk / current_price) < 0.0005:
+            # Минимальный размер риска в зависимости от типа рынка
+            min_risk = current_price * 0.0012 if is_forex else current_price * 0.0025
+            if risk < min_risk:
                 local_low_h1 = min([b["low"] for b in h1_bars[-3:]])
-                stop_loss = local_low_h1 * 0.9995
+                stop_loss = local_low_h1 * (1.0 - buffer_pct)
                 risk = current_price - stop_loss
 
             target_1 = current_price + (risk * 2.0)
             target_2 = current_price + (risk * 4.0)
         else:
             local_high = max([b["high"] for b in m5_bars[-8:]])
-            stop_loss = local_high * 1.0005
+            stop_loss = local_high * (1.0 + buffer_pct)
             risk = stop_loss - current_price
             
-            if risk <= 0 or (risk / current_price) < 0.0005:
+            min_risk = current_price * 0.0012 if is_forex else current_price * 0.0025
+            if risk < min_risk:
                 local_high_h1 = max([b["high"] for b in h1_bars[-3:]])
-                stop_loss = local_high_h1 * 1.0005
+                stop_loss = local_high_h1 * (1.0 + buffer_pct)
                 risk = stop_loss - current_price
 
             target_1 = current_price - (risk * 2.0)
@@ -176,7 +182,7 @@ def format_confirmed_signal(symbol, event, current_price):
         f"📊 **Направление:** `{event['direction']}` (База: `{event['tf']}`)\n"
         f"⚡️ **Структура подтверждена закрепом на M5!**\n\n"
         f"📍 **Цена входа:** `{current_price:.5f}`\n"
-        f"🛑 **Стоп-лосс (M5/1H SL):** `{event['stop_loss']:.5f}`\n"
+        f"🛑 **Стоп-лосс (M5/1H SL + Спред):** `{event['stop_loss']:.5f}`\n"
         f"🎯 **T1:** `{event['target_1']:.5f}` | **T2:** `{event['target_2']:.5f}`\n\n"
-        f"🚀 _Оптимизированный риск-менеджмент применен. Можно входить!_"
+        f"🚀 _Оптимизированный риск-менеджмент с учетом спреда применен!_"
     )
