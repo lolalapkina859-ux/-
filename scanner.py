@@ -76,7 +76,7 @@ def detect_sweep(d1_bars, h4_bars, h1_bars, symbol="UNKNOWN"):
         f"Таймфрейм: {tf} | Направление: {direction} | Уровень: {level:.5f} | Закрытие: {current_close:.5f}"
     )
 
-г    # Первичный расчет стопа для превью (пока идет ожидание закрепа)
+    # Первичный расчет стопа для превью (пока идет ожидание закрепа)
     if direction == "SHORT":
         stop_loss = level + (level * 0.0035)
         risk = stop_loss - current_close
