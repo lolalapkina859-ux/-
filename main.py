@@ -26,9 +26,6 @@ SYMBOLS = {
     "BTC / USDT": {"source": "bingx", "ticker": "BTC-USDT"},
     "ETH / USDT": {"source": "bingx", "ticker": "ETH-USDT"},
     "SOL / USDT": {"source": "bingx", "ticker": "SOL-USDT"},
-    "XRP / USDT": {"source": "bingx", "ticker": "XRP-USDT"},
-    "BNB / USDT": {"source": "bingx", "ticker": "BNB-USDT"},
-    "DOGE / USDT": {"source": "bingx", "ticker": "DOGE-USDT"},
 
     # Commodities & Metals (yfinance)
     "XAU / USD": {"source": "yfinance", "ticker": "GC=F"},
