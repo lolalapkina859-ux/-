@@ -1,6 +1,5 @@
 import logging
 
-# Настройка логгера для модуля Liquidity Hunter FX
 log = logging.getLogger("liquidity-hunter")
 
 
@@ -12,12 +11,10 @@ def detect_sweep(d1_bars, h4_bars, h1_bars, symbol="UNKNOWN"):
         log.warning(f"[{symbol}] Отсутствуют бары для одного или нескольких ТФ (1D, 4H, 1H). Пропуск анализа.")
         return None
 
-    # Берем последние закрытые свечи для каждого таймфрейма
     d1_curr = d1_bars[-1]
     h4_curr = h4_bars[-1]
     h1_curr = h1_bars[-1]
 
-    # Исторические экстремумы для поиска ликвидности (без учета текущей свечи)
     d1_high = max([b["high"] for b in d1_bars[-21:-1]])
     d1_low = min([b["low"] for b in d1_bars[-21:-1]])
 
@@ -33,7 +30,6 @@ def detect_sweep(d1_bars, h4_bars, h1_bars, symbol="UNKNOWN"):
     current_close = 0.0
     bar_time = None
 
-    # 1. Проверяем старший таймфрейм 1D (снятие дневного пула)
     if d1_curr["high"] > d1_high and d1_curr["close"] < d1_high:
         direction = "SHORT"
         level = d1_high
@@ -46,8 +42,6 @@ def detect_sweep(d1_bars, h4_bars, h1_bars, symbol="UNKNOWN"):
         tf = "1D"
         current_close = d1_curr["close"]
         bar_time = d1_curr["timestamp"]
-
-    # 2. Проверяем 4H
     elif h4_curr["high"] > h4_high and h4_curr["close"] < h4_high:
         direction = "SHORT"
         level = h4_high
@@ -60,8 +54,6 @@ def detect_sweep(d1_bars, h4_bars, h1_bars, symbol="UNKNOWN"):
         tf = "4H"
         current_close = h4_curr["close"]
         bar_time = h4_curr["timestamp"]
-
-    # 3. Проверяем 1H
     elif h1_curr["high"] > h1_high and h1_curr["close"] < h1_high:
         direction = "SHORT"
         level = h1_high
@@ -84,7 +76,6 @@ def detect_sweep(d1_bars, h4_bars, h1_bars, symbol="UNKNOWN"):
         f"Таймфрейм: {tf} | Направление: {direction} | Уровень: {level:.5f} | Закрытие: {current_close:.5f}"
     )
 
-    # Расчет стоп-лосса и целей
     if direction == "SHORT":
         stop_loss = level + (level * 0.0035)
         risk = stop_loss - current_close
@@ -95,10 +86,6 @@ def detect_sweep(d1_bars, h4_bars, h1_bars, symbol="UNKNOWN"):
         risk = current_close - stop_loss
         target_1 = current_close + (risk * 1.5)
         target_2 = current_close + (risk * 3.5)
-
-    log.debug(
-        f"[{symbol}] Расчетные параметры: SL={stop_loss:.5f}, T1={target_1:.5f}, T2={target_2:.5f}, Risk={risk:.5f}"
-    )
 
     return {
         "direction": direction,
@@ -114,9 +101,7 @@ def detect_sweep(d1_bars, h4_bars, h1_bars, symbol="UNKNOWN"):
 
 
 def format_signal(symbol, event):
-    """Форматирование расширенного сообщения с SMC-инструкцией для Telegram"""
-    log.debug(f"[{symbol}] Форматирование SMC-алерта для Telegram...")
-
+    """Форматирование первичного предупреждения о свипе"""
     emoji = "🔴" if event["direction"] == "SHORT" else "🟢"
     action_verb = (
         "пробоя вниз и закрепа"
@@ -125,7 +110,7 @@ def format_signal(symbol, event):
     )
     cisd_type = "+CISD" if event["direction"] == "SHORT" else "-CISD"
 
-    msg = (
+    return (
         f"{emoji} **LIQUIDITY SWEEP ALERT** {emoji}\n\n"
         f"🪙 **Инструмент:** `{symbol}`\n"
         f"⏱ **Таймфрейм:** `{event['tf']}`\n"
@@ -134,12 +119,24 @@ def format_signal(symbol, event):
         f"⚡️ **Ключевой уровень структуры ({cisd_type}):** `{event['entry']:.5f}`\n\n"
         f"📝 **SMC Резюме и Инструкция:**\n"
         f"⚠️ _Не входите вслепую! Ждем реакции:_\n"
-        f"• Дождитесь {action_verb} (закрытие M5/M15) уровня `{event['entry']:.5f}`.\n"
+        f"• Дождитесь {action_verb} (закрытие свечи) уровня `{event['entry']:.5f}`.\n"
         f"• Входите только после подтверждения структуры.\n\n"
         f"🛑 **Стоп-лосс (SL):** `{event['stop_loss']:.5f}`\n"
         f"🎯 **T1 (Частичная фиксация / БУ):** `{event['target_1']:.5f}` _(R:R 1.5)_\n"
         f"🚀 **T2 (Глобальная цель):** `{event['target_2']:.5f}` _(R:R 3.5)_\n"
     )
-    
-    log.info(f"[{symbol}] Сформировано сообщение для Telegram (длина: {len(msg)} симв.).")
-    return msg
+
+
+def format_confirmed_signal(symbol, event, current_price):
+    """Форматирование второго подтверждающего алерта о готовности входа"""
+    emoji = "🟢" if event["direction"] == "LONG" else "🔴"
+    return (
+        f"✅ **SETUP CONFIRMED / ENTRY READY** ✅\n\n"
+        f"{emoji} **Инструмент:** `{symbol}`\n"
+        f"📊 **Направление:** `{event['direction']}` (`{event['tf']}`)\n"
+        f"⚡️ **Структура подтверждена закрепом!**\n\n"
+        f"📍 **Текущая цена:** `{current_price:.5f}`\n"
+        f"🛑 **Стоп-лосс (SL):** `{event['stop_loss']:.5f}`\n"
+        f"🎯 **T1:** `{event['target_1']:.5f}` | **T2:** `{event['target_2']:.5f}`\n\n"
+        f"🚀 _Можно открывать позицию по рынку или на локальном откате!_"
+    )
