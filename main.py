@@ -5,7 +5,12 @@ import requests
 from datetime import datetime, timezone
 from dotenv import load_dotenv
 import yfinance as yf
-from scanner import detect_sweep, format_signal, format_confirmed_signal
+from scanner import (
+    detect_sweep, 
+    format_signal, 
+    format_confirmed_signal, 
+    optimize_sl_tp_on_confirmation
+)
 from tracker import init_db, save_signal, check_open_trades
 
 load_dotenv()
@@ -14,7 +19,7 @@ log = logging.getLogger("liquidity-hunter")
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
-SCAN_SECONDS = int(os.getenv("SCAN_INTERVAL_SECONDS", "60")) # Рекомендую 60 сек для M5
+SCAN_SECONDS = int(os.getenv("SCAN_INTERVAL_SECONDS", "60"))  # 60 секунд для быстрого отслеживания M5
 
 SYMBOLS = {
     "BTC / USDT": {"source": "bingx", "ticker": "BTC-USDT"},
@@ -32,7 +37,7 @@ SYMBOLS = {
 
 last_alerts = set()
 symbol_cooldown = {}
-COOLDOWN_SECONDS = 10800  # 3 часа перерыва после подтвержденного входа
+COOLDOWN_SECONDS = 10800  # 3 часа перерыва после подтвержденного сигнала
 
 # Ожидающие подтверждения закрепа на M5
 pending_setups = {}
@@ -103,12 +108,13 @@ def scan_once():
             source = info["source"]
             ticker = info["ticker"]
 
-            # 1. ПРОВЕРКА ПОДТВЕРЖДЕНИЯ НА M5 (Быстрый вход)
+            # 1. ПРОВЕРКА ПОДТВЕРЖДЕНИЯ НА M5 (Быстрый вход и оптимизация стопа)
             if display_symbol in pending_setups:
                 log.info("Checking M5 confirmation for %s...", display_symbol)
                 m5 = fetch_bingx_bars(ticker, "5m") if source == "bingx" else fetch_yfinance_bars(ticker, "5m")
+                h1 = fetch_bingx_bars(ticker, "1h") if source == "bingx" else fetch_yfinance_bars(ticker, "1h")
                 
-                if m5:
+                if m5 and h1:
                     last_m5_close = m5[-1]["close"]
                     current_prices[display_symbol] = {
                         "high": m5[-1]["high"],
@@ -117,7 +123,7 @@ def scan_once():
                     }
                     
                     setup = pending_setups[display_symbol]
-                    level = setup["entry"] # Ключевой уровень (+CISD / -CISD)
+                    level = setup["entry"]  # Ключевой уровень (+CISD / -CISD)
                     direction = setup["direction"]
 
                     confirmed = False
@@ -128,6 +134,17 @@ def scan_once():
 
                     if confirmed:
                         log.info(f"⚡️ [{display_symbol}] M5 CONFIRMED! Закрытие {last_m5_close} за уровнем {level}")
+                        
+                        # Пересчитываем локальный стоп-лосс под M5/1H фракталы
+                        opt_sl, opt_t1, opt_t2, opt_rr = optimize_sl_tp_on_confirmation(
+                            direction, last_m5_close, m5, h1
+                        )
+                        if opt_sl:
+                            setup["stop_loss"] = opt_sl
+                            setup["target_1"] = opt_t1
+                            setup["target_2"] = opt_t2
+                            setup["rr_ratio"] = opt_rr
+
                         telegram(format_confirmed_signal(display_symbol, setup, last_m5_close))
                         
                         save_signal(
