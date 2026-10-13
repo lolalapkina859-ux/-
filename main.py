@@ -22,13 +22,29 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 SCAN_SECONDS = int(os.getenv("SCAN_INTERVAL_SECONDS", "60"))  # 60 секунд для быстрого отслеживания M5
 
 SYMBOLS = {
+    # Crypto (BingX)
     "BTC / USDT": {"source": "bingx", "ticker": "BTC-USDT"},
     "ETH / USDT": {"source": "bingx", "ticker": "ETH-USDT"},
     "SOL / USDT": {"source": "bingx", "ticker": "SOL-USDT"},
+    "XRP / USDT": {"source": "bingx", "ticker": "XRP-USDT"},
+    "BNB / USDT": {"source": "bingx", "ticker": "BNB-USDT"},
+    "DOGE / USDT": {"source": "bingx", "ticker": "DOGE-USDT"},
+
+    # Commodities & Metals (yfinance)
     "XAU / USD": {"source": "yfinance", "ticker": "GC=F"},
+    "XAG / USD": {"source": "yfinance", "ticker": "SI=F"},
+    "USOIL / USD": {"source": "yfinance", "ticker": "CL=F"},
+
+    # Indices (yfinance)
+    "US500 / USD": {"source": "yfinance", "ticker": "SPY"},
+    "NAS100 / USD": {"source": "yfinance", "ticker": "QQQ"},
+
+    # Forex Majors & Crosses (yfinance)
     "EUR / USD": {"source": "yfinance", "ticker": "EURUSD=X"},
     "GBP / USD": {"source": "yfinance", "ticker": "GBPUSD=X"},
     "USD / JPY": {"source": "yfinance", "ticker": "USDJPY=X"},
+    "GBP / JPY": {"source": "yfinance", "ticker": "GBPJPY=X"},
+    "EUR / JPY": {"source": "yfinance", "ticker": "EURJPY=X"},
     "USD / CAD": {"source": "yfinance", "ticker": "USDCAD=X"},
     "NZD / USD": {"source": "yfinance", "ticker": "NZDUSD=X"},
     "AUD / USD": {"source": "yfinance", "ticker": "AUDUSD=X"},
