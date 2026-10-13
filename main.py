@@ -28,6 +28,7 @@ SYMBOLS = {
     "USD / CAD": {"source": "yfinance", "ticker": "USDCAD=X"},
     "NZD / USD": {"source": "yfinance", "ticker": "NZDUSD=X"},
     "AUD / USD": {"source": "yfinance", "ticker": "AUDUSD=X"},
+    "EUR / GBP": {"source": "yfinance", "ticker": "EURGBP=X"},
 }
 
 last_alerts = set()
