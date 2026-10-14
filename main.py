@@ -34,7 +34,7 @@ SYMBOLS = {
 
     # Indices (yfinance)
     "US500 / USD": {"source": "yfinance", "ticker": "SPY"},
-    "NAS100 / USD": {"source": "yfinance", "ticker": "QQQ"},
+    "NAS100 / USD": {"source": "yfinance", "ticker": "NQ=F"},
 
     # Forex Majors & Crosses (yfinance)
     "EUR / USD": {"source": "yfinance", "ticker": "EURUSD=X"},
