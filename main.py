@@ -28,8 +28,8 @@ SYMBOLS = {
     "SOL / USDT": {"source": "bingx", "ticker": "SOL-USDT"},
 
     # Commodities & Metals (yfinance)
-    "XAU / USD": {"source": "yfinance", "ticker": "GC=F"},
-    "XAG / USD": {"source": "yfinance", "ticker": "SI=F"},
+    "XAU / USD": {"source": "yfinance", "ticker": "XAUT-USD"},
+    "XAG / USD": {"source": "yfinance", "ticker": "SILVER=X"}, # или спотовый эквивалент
     "USOIL / USD": {"source": "yfinance", "ticker": "CL=F"},
 
     # Indices (yfinance)
