@@ -253,14 +253,16 @@ def scan_once():
                 h4 = fetch_yfinance_bars(ticker, "4h")
                 h1 = fetch_yfinance_bars(ticker, "1h")
 
-            if h1 and display_symbol not in current_prices:
+            current_market_price = None
+            if h1:
+                current_market_price = h1[-1]["close"]
                 current_prices[display_symbol] = {
                     "high": h1[-1]["high"],
                     "low": h1[-1]["low"],
-                    "close": h1[-1]["close"]
+                    "close": current_market_price
                 }
 
-            event = detect_sweep(d1, h4, h1, display_symbol)
+            event = detect_sweep(d1, h4, h1, display_symbol, current_price=current_market_price)
             if not event:
                 time.sleep(0.15)
                 continue
