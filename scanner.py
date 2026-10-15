@@ -5,32 +5,32 @@ log = logging.getLogger("liquidity-hunter")
 
 def is_strong_impulse_against(direction, htf_bars):
     """
-    Проверка на агрессивный трендовый импульс на старшем ТФ (4H/1H), 
-    чтобы не брать сделки против 'падающего ножа'.
+    Проверка на агрессивный трендовый импульс против предполагаемой сделки.
     """
     if len(htf_bars) < 3:
         return False
 
-    recent_bars = htf_bars[-3:-1]  # Берем предыдущие сформированные свечи
+    recent_bars = htf_bars[-3:-1]
     avg_body = sum([abs(b["close"] - b["open"]) for b in recent_bars]) / len(recent_bars)
     
     if direction == "LONG":
         bearish_count = sum(1 for b in recent_bars if b["close"] < b["open"])
         if bearish_count >= 2 and avg_body > (recent_bars[-1]["high"] - recent_bars[-1]["low"]) * 0.65:
-            return True  # Сильный нисходящий импульс, LONG опасен!
+            return True
             
     elif direction == "SHORT":
         bullish_count = sum(1 for b in recent_bars if b["close"] > b["open"])
         if bullish_count >= 2 and avg_body > (recent_bars[-1]["high"] - recent_bars[-1]["low"]) * 0.65:
-            return True  # Сильный восходящий импульс, SHORT опасен!
+            return True
 
     return False
 
 
 def detect_sweep(d1_bars, h4_bars, h1_bars, symbol="UNKNOWN"):
     """
-    Поиск ликвидности (Liquidity Sweep) по правилам CRT исключительно 
-    на 4H и 1H с жесткой защитой от True BOS (истинного пробоя).
+    Двухрежимный анализ CRT / SMC:
+    1. Liquidity Sweep -> Контртрендовый сетап (разворот от зачистки ликвидности).
+    2. True BOS -> Трендовый сетап (вход на продолжение пробоя после отката).
     """
     if not h4_bars or not h1_bars:
         log.warning(f"[{symbol}] Отсутствуют бары для 4H или 1H. Пропуск анализа.")
@@ -39,7 +39,7 @@ def detect_sweep(d1_bars, h4_bars, h1_bars, symbol="UNKNOWN"):
     h4_curr = h4_bars[-1]
     h1_curr = h1_bars[-1]
 
-    # CRT Диапазоны 4H и 1H (границы предыдущих свечей/консолидаций)
+    # Границы CRT диапазонов (4H и 1H)
     h4_high = max([b["high"] for b in h4_bars[-16:-1]])
     h4_low = min([b["low"] for b in h4_bars[-16:-1]])
 
@@ -47,6 +47,7 @@ def detect_sweep(d1_bars, h4_bars, h1_bars, symbol="UNKNOWN"):
     h1_low = min([b["low"] for b in h1_bars[-20:-1]])
 
     direction = None
+    setup_type = None  # "SWEEP" или "BOS"
     level = 0.0
     tf = None
     current_close = 0.0
@@ -55,91 +56,106 @@ def detect_sweep(d1_bars, h4_bars, h1_bars, symbol="UNKNOWN"):
 
     # --- ПРОВЕРКА 4H (Приоритет) ---
     if h4_curr["high"] > h4_high:
-        # Проверяем: если тело закрылось ВЫШЕ уровня — это True BOS, а не Sweep!
+        level = h4_high
+        tf = "4H (CRT)"
+        current_close = h4_curr["close"]
+        bar_time = h4_curr["timestamp"]
+        htf_bars_ref = h4_bars
+
         if h4_curr["close"] > h4_high:
-            log.info(f"⛔️ [{symbol}] 4H True BOS вверх: тело закрылось выше уровня {h4_high}. Игнорируем.")
+            # Истинный пробой верхнего уровня -> Трендовый LONG
+            setup_type = "BOS"
+            direction = "LONG"
         else:
-            # Проверяем наличие фитиля сверху (Sweep)
+            # Сбор ликвидности сверху -> Контртрендовый SHORT
             upper_wick = h4_curr["high"] - max(h4_curr["open"], h4_curr["close"])
             body_size = abs(h4_curr["close"] - h4_curr["open"])
-            if upper_wick > 0 and (upper_wick >= body_size * 0.3):  # фитиль должен составлять существенную часть
+            if upper_wick > 0 and (upper_wick >= body_size * 0.3):
+                setup_type = "SWEEP"
                 direction = "SHORT"
-                level = h4_high
-                tf = "4H (CRT)"
-                current_close = h4_curr["close"]
-                bar_time = h4_curr["timestamp"]
-                htf_bars_ref = h4_bars
 
     elif h4_curr["low"] < h4_low:
+        level = h4_low
+        tf = "4H (CRT)"
+        current_close = h4_curr["close"]
+        bar_time = h4_curr["timestamp"]
+        htf_bars_ref = h4_bars
+
         if h4_curr["close"] < h4_low:
-            log.info(f"⛔️ [{symbol}] 4H True BOS вниз: тело закрылось ниже уровня {h4_low}. Игнорируем.")
+            # Истинный пробой нижнего уровня -> Трендовый SHORT
+            setup_type = "BOS"
+            direction = "SHORT"
         else:
+            # Сбор ликвидности снизу -> Контртрендовый LONG
             lower_wick = min(h4_curr["open"], h4_curr["close"]) - h4_curr["low"]
             body_size = abs(h4_curr["close"] - h4_curr["open"])
             if lower_wick > 0 and (lower_wick >= body_size * 0.3):
+                setup_type = "SWEEP"
                 direction = "LONG"
-                level = h4_low
-                tf = "4H (CRT)"
-                current_close = h4_curr["close"]
-                bar_time = h4_curr["timestamp"]
-                htf_bars_ref = h4_bars
 
     # --- ПРОВЕРКА 1H ---
-    if not direction:
+    if not setup_type:
         if h1_curr["high"] > h1_high:
+            level = h1_high
+            tf = "1H (CRT)"
+            current_close = h1_curr["close"]
+            bar_time = h1_curr["timestamp"]
+            htf_bars_ref = h1_bars
+
             if h1_curr["close"] > h1_high:
-                log.info(f"⛔️ [{symbol}] 1H True BOS вверх: тело закрылось выше уровня {h1_high}. Игнорируем.")
+                setup_type = "BOS"
+                direction = "LONG"
             else:
                 upper_wick = h1_curr["high"] - max(h1_curr["open"], h1_curr["close"])
                 body_size = abs(h1_curr["close"] - h1_curr["open"])
                 if upper_wick > 0 and (upper_wick >= body_size * 0.3):
+                    setup_type = "SWEEP"
                     direction = "SHORT"
-                    level = h1_high
-                    tf = "1H (CRT)"
-                    current_close = h1_curr["close"]
-                    bar_time = h1_curr["timestamp"]
-                    htf_bars_ref = h1_bars
 
         elif h1_curr["low"] < h1_low:
+            level = h1_low
+            tf = "1H (CRT)"
+            current_close = h1_curr["close"]
+            bar_time = h1_curr["timestamp"]
+            htf_bars_ref = h1_bars
+
             if h1_curr["close"] < h1_low:
-                log.info(f"⛔️ [{symbol}] 1H True BOS вниз: тело закрылось ниже уровня {h1_low}. Игнорируем.")
+                setup_type = "BOS"
+                direction = "SHORT"
             else:
                 lower_wick = min(h1_curr["open"], h1_curr["close"]) - h1_curr["low"]
                 body_size = abs(h1_curr["close"] - h1_curr["open"])
                 if lower_wick > 0 and (lower_wick >= body_size * 0.3):
+                    setup_type = "SWEEP"
                     direction = "LONG"
-                    level = h1_low
-                    tf = "1H (CRT)"
-                    current_close = h1_curr["close"]
-                    bar_time = h1_curr["timestamp"]
-                    htf_bars_ref = h1_bars
 
-    if not direction:
-        log.debug(f"[{symbol}] Валидных CRT манипуляций (Sweep) на 4H/1H не обнаружено.")
+    if not setup_type:
         return None
 
-    # ПРОВЕРКА ФИЛЬТРА ИМПУЛЬСА
-    if is_strong_impulse_against(direction, htf_bars_ref):
-        log.info(f"⛔️ [{symbol}] CRT Sweep проигнорирован: сильный контртрендовый импульс на {tf}.")
+    # Фильтр сильного контртрендового движения (для SWEEP сетапов)
+    if setup_type == "SWEEP" and is_strong_impulse_against(direction, htf_bars_ref):
+        log.info(f"⛔️ [{symbol}] SWEEP проигнорирован: сильный контртрендовый импульс на {tf}.")
         return None
 
     log.info(
-        f"🎯 [{symbol}] ВАЛИДНЫЙ CRT SWEEP! "
-        f"Таймфрейм: {tf} | Направление: {direction} | Уровень CRT: {level:.5f}"
+        f"🎯 [{symbol}] ОБНАРУЖЕН {setup_type}! "
+        f"Таймфрейм: {tf} | Направление: {direction} | Уровень: {level:.5f}"
     )
 
+    # Расчет Stop-Loss & Targets
     if direction == "SHORT":
-        stop_loss = level + (level * 0.0035)
+        stop_loss = level + (level * 0.0035) if setup_type == "SWEEP" else current_close + (current_close * 0.004)
         risk = stop_loss - current_close
         target_1 = current_close - (risk * 1.5)
         target_2 = current_close - (risk * 3.5)
-    else:
-        stop_loss = level - (level * 0.0035)
+    else:  # LONG
+        stop_loss = level - (level * 0.0035) if setup_type == "SWEEP" else current_close - (current_close * 0.004)
         risk = current_close - stop_loss
         target_1 = current_close + (risk * 1.5)
         target_2 = current_close + (risk * 3.5)
 
     return {
+        "setup_type": setup_type,  # SWEEP или BOS
         "direction": direction,
         "tf": tf,
         "level": level,
@@ -154,8 +170,7 @@ def detect_sweep(d1_bars, h4_bars, h1_bars, symbol="UNKNOWN"):
 
 def optimize_sl_tp_on_confirmation(direction, current_price, m5_bars, h1_bars, symbol="UNKNOWN"):
     """
-    Оптимизация стопа с проверкой на Expansion Candle (свечу расширения M5)
-    и защитой от спреда.
+    Оптимизация стопа с проверкой на Expansion Candle (свечу расширения M5).
     """
     try:
         last_candle = m5_bars[-1]
@@ -203,18 +218,19 @@ def optimize_sl_tp_on_confirmation(direction, current_price, m5_bars, h1_bars, s
 
 
 def format_signal(symbol, event):
-    emoji = "🔴" if event["direction"] == "SHORT" else "🟢"
-    cisd_type = "+CISD" if event["direction"] == "SHORT" else "-CISD"
+    emoji = "🚀" if event["setup_type"] == "BOS" else ("🔴" if event["direction"] == "SHORT" else "🟢")
+    title = f"⚡️ TRUE BOS BREAKOUT ⚡️" if event["setup_type"] == "BOS" else "🔴 CRT LIQUIDITY SWEEP 🔴"
+    plan_note = "Ожидаем ретеста/закрепления на M5 по тренду." if event["setup_type"] == "BOS" else f"Ждем подтверждения Expansion-свечой на M5 уровня {event['entry']:.5f}."
 
     return (
-        f"{emoji} **CRT LIQUIDITY SWEEP** {emoji}\n\n"
+        f"{title}\n\n"
         f"🪙 **Инструмент:** `{symbol}`\n"
-        f"⏱ **CRT Таймфрейм:** `{event['tf']}`\n"
-        f"📊 **Направление:** `{event['direction']}`\n\n"
-        f"📍 **Граница CRT диапазона:** `{event['level']:.5f}`\n"
-        f"⚡️ **Уровень структуры ({cisd_type}):** `{event['entry']:.5f}`\n\n"
+        f"⏱ **Таймфрейм:** `{event['tf']}`\n"
+        f"📊 **Тип:** `{event['setup_type']}` | **Направление:** `{event['direction']}`\n\n"
+        f"📍 **Пробитый уровень:** `{event['level']:.5f}`\n"
+        f"⚡️ **Текущая цена:** `{event['entry']:.5f}`\n\n"
         f"📝 **План торговли:**\n"
-        f"• Ждем подтверждения Expansion-свечой на M5/M15 уровня `{event['entry']:.5f}`.\n\n"
+        f"• {plan_note}\n\n"
         f"🛑 **SL:** `{event['stop_loss']:.5f}`\n"
         f"🎯 **T1:** `{event['target_1']:.5f}` | 🚀 **T2:** `{event['target_2']:.5f}`\n"
     )
@@ -222,13 +238,14 @@ def format_signal(symbol, event):
 
 def format_confirmed_signal(symbol, event, current_price):
     emoji = "🟢" if event["direction"] == "LONG" else "🔴"
+    setup_name = "TRUE BOS TREND ENTRY" if event.get("setup_type") == "BOS" else "CRT SWEEP EXPANSION"
     return (
-        f"✅ **CRT SETUP CONFIRMED (EXPANSION)** ✅\n\n"
+        f"✅ **{setup_name} CONFIRMED** ✅\n\n"
         f"{emoji} **Инструмент:** `{symbol}`\n"
         f"📊 **Направление:** `{event['direction']}` (База: `{event['tf']}`)\n"
-        f"⚡️ **Импульс расширения (Expansion) на M5 зафиксирован!**\n\n"
+        f"⚡️ **Подтверждение на M5 зафиксировано!**\n\n"
         f"📍 **Вход:** `{current_price:.5f}`\n"
-        f"🛑 **Стоп-лосс (CRT + Spread SL):** `{event['stop_loss']:.5f}`\n"
+        f"🛑 **Стоп-лосс:** `{event['stop_loss']:.5f}`\n"
         f"🎯 **T1:** `{event['target_1']:.5f}` | **T2:** `{event['target_2']:.5f}`\n\n"
         f"🚀 _Вход по правилам CRT & SMC готов!_"
     )
