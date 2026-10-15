@@ -30,7 +30,7 @@ def is_strong_impulse_against(direction, htf_bars):
 def detect_sweep(d1_bars, h4_bars, h1_bars, symbol="UNKNOWN"):
     """
     Поиск ликвидности (Liquidity Sweep) по правилам CRT исключительно 
-    на 4H и 1H с проверкой закрытия тела внутри диапазона.
+    на 4H и 1H с жесткой защитой от True BOS (истинного пробоя).
     """
     if not h4_bars or not h1_bars:
         log.warning(f"[{symbol}] Отсутствуют бары для 4H или 1H. Пропуск анализа.")
@@ -54,38 +54,68 @@ def detect_sweep(d1_bars, h4_bars, h1_bars, symbol="UNKNOWN"):
     htf_bars_ref = None
 
     # --- ПРОВЕРКА 4H (Приоритет) ---
-    if h4_curr["high"] > h4_high and h4_curr["close"] < h4_high:
-        direction = "SHORT"
-        level = h4_high
-        tf = "4H (CRT)"
-        current_close = h4_curr["close"]
-        bar_time = h4_curr["timestamp"]
-        htf_bars_ref = h4_bars
-    elif h4_curr["low"] < h4_low and h4_curr["close"] > h4_low:
-        direction = "LONG"
-        level = h4_low
-        tf = "4H (CRT)"
-        current_close = h4_curr["close"]
-        bar_time = h4_curr["timestamp"]
-        htf_bars_ref = h4_bars
+    if h4_curr["high"] > h4_high:
+        # Проверяем: если тело закрылось ВЫШЕ уровня — это True BOS, а не Sweep!
+        if h4_curr["close"] > h4_high:
+            log.info(f"⛔️ [{symbol}] 4H True BOS вверх: тело закрылось выше уровня {h4_high}. Игнорируем.")
+        else:
+            # Проверяем наличие фитиля сверху (Sweep)
+            upper_wick = h4_curr["high"] - max(h4_curr["open"], h4_curr["close"])
+            body_size = abs(h4_curr["close"] - h4_curr["open"])
+            if upper_wick > 0 and (upper_wick >= body_size * 0.3):  # фитиль должен составлять существенную часть
+                direction = "SHORT"
+                level = h4_high
+                tf = "4H (CRT)"
+                current_close = h4_curr["close"]
+                bar_time = h4_curr["timestamp"]
+                htf_bars_ref = h4_bars
+
+    elif h4_curr["low"] < h4_low:
+        if h4_curr["close"] < h4_low:
+            log.info(f"⛔️ [{symbol}] 4H True BOS вниз: тело закрылось ниже уровня {h4_low}. Игнорируем.")
+        else:
+            lower_wick = min(h4_curr["open"], h4_curr["close"]) - h4_curr["low"]
+            body_size = abs(h4_curr["close"] - h4_curr["open"])
+            if lower_wick > 0 and (lower_wick >= body_size * 0.3):
+                direction = "LONG"
+                level = h4_low
+                tf = "4H (CRT)"
+                current_close = h4_curr["close"]
+                bar_time = h4_curr["timestamp"]
+                htf_bars_ref = h4_bars
 
     # --- ПРОВЕРКА 1H ---
-    elif h1_curr["high"] > h1_high and h1_curr["close"] < h1_high:
-        direction = "SHORT"
-        level = h1_high
-        tf = "1H (CRT)"
-        current_close = h1_curr["close"]
-        bar_time = h1_curr["timestamp"]
-        htf_bars_ref = h1_bars
-    elif h1_curr["low"] < h1_low and h1_curr["close"] > h1_low:
-        direction = "LONG"
-        level = h1_low
-        tf = "1H (CRT)"
-        current_close = h1_curr["close"]
-        bar_time = h1_curr["timestamp"]
+    if not direction:
+        if h1_curr["high"] > h1_high:
+            if h1_curr["close"] > h1_high:
+                log.info(f"⛔️ [{symbol}] 1H True BOS вверх: тело закрылось выше уровня {h1_high}. Игнорируем.")
+            else:
+                upper_wick = h1_curr["high"] - max(h1_curr["open"], h1_curr["close"])
+                body_size = abs(h1_curr["close"] - h1_curr["open"])
+                if upper_wick > 0 and (upper_wick >= body_size * 0.3):
+                    direction = "SHORT"
+                    level = h1_high
+                    tf = "1H (CRT)"
+                    current_close = h1_curr["close"]
+                    bar_time = h1_curr["timestamp"]
+                    htf_bars_ref = h1_bars
+
+        elif h1_curr["low"] < h1_low:
+            if h1_curr["close"] < h1_low:
+                log.info(f"⛔️ [{symbol}] 1H True BOS вниз: тело закрылось ниже уровня {h1_low}. Игнорируем.")
+            else:
+                lower_wick = min(h1_curr["open"], h1_curr["close"]) - h1_curr["low"]
+                body_size = abs(h1_curr["close"] - h1_curr["open"])
+                if lower_wick > 0 and (lower_wick >= body_size * 0.3):
+                    direction = "LONG"
+                    level = h1_low
+                    tf = "1H (CRT)"
+                    current_close = h1_curr["close"]
+                    bar_time = h1_curr["timestamp"]
+                    htf_bars_ref = h1_bars
 
     if not direction:
-        log.debug(f"[{symbol}] CRT манипуляций на 4H/1H не обнаружено.")
+        log.debug(f"[{symbol}] Валидных CRT манипуляций (Sweep) на 4H/1H не обнаружено.")
         return None
 
     # ПРОВЕРКА ФИЛЬТРА ИМПУЛЬСА
