@@ -29,7 +29,7 @@ SYMBOLS = {
 
     # Commodities & Metals (yfinance)
     "XAU / USD": {"source": "yfinance", "ticker": "XAUT-USD"},
-    "XAG / USD": {"source": "yfinance", "ticker": "SILVER=X"}, # или спотовый эквивалент
+    "XAG / USD": {"source": "yfinance", "ticker": "SI=F"},
     "USOIL / USD": {"source": "yfinance", "ticker": "CL=F"},
 
     # Indices (yfinance)
