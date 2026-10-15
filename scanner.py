@@ -26,7 +26,7 @@ def is_strong_impulse_against(direction, htf_bars):
     return False
 
 
-def detect_sweep(d1_bars, h4_bars, h1_bars, symbol="UNKNOWN"):
+def detect_sweep(d1_bars, h4_bars, h1_bars, symbol="UNKNOWN", current_price=None):
     """
     Двухрежимный анализ CRT / SMC:
     1. Liquidity Sweep -> Контртрендовый сетап (разворот от зачистки ликвидности).
@@ -50,7 +50,6 @@ def detect_sweep(d1_bars, h4_bars, h1_bars, symbol="UNKNOWN"):
     setup_type = None  # "SWEEP" или "BOS"
     level = 0.0
     tf = None
-    current_close = 0.0
     bar_time = None
     htf_bars_ref = None
 
@@ -58,16 +57,13 @@ def detect_sweep(d1_bars, h4_bars, h1_bars, symbol="UNKNOWN"):
     if h4_curr["high"] > h4_high:
         level = h4_high
         tf = "4H (CRT)"
-        current_close = h4_curr["close"]
         bar_time = h4_curr["timestamp"]
         htf_bars_ref = h4_bars
 
         if h4_curr["close"] > h4_high:
-            # Истинный пробой верхнего уровня -> Трендовый LONG
             setup_type = "BOS"
             direction = "LONG"
         else:
-            # Сбор ликвидности сверху -> Контртрендовый SHORT
             upper_wick = h4_curr["high"] - max(h4_curr["open"], h4_curr["close"])
             body_size = abs(h4_curr["close"] - h4_curr["open"])
             if upper_wick > 0 and (upper_wick >= body_size * 0.3):
@@ -77,16 +73,13 @@ def detect_sweep(d1_bars, h4_bars, h1_bars, symbol="UNKNOWN"):
     elif h4_curr["low"] < h4_low:
         level = h4_low
         tf = "4H (CRT)"
-        current_close = h4_curr["close"]
         bar_time = h4_curr["timestamp"]
         htf_bars_ref = h4_bars
 
         if h4_curr["close"] < h4_low:
-            # Истинный пробой нижнего уровня -> Трендовый SHORT
             setup_type = "BOS"
             direction = "SHORT"
         else:
-            # Сбор ликвидности снизу -> Контртрендовый LONG
             lower_wick = min(h4_curr["open"], h4_curr["close"]) - h4_curr["low"]
             body_size = abs(h4_curr["close"] - h4_curr["open"])
             if lower_wick > 0 and (lower_wick >= body_size * 0.3):
@@ -98,7 +91,6 @@ def detect_sweep(d1_bars, h4_bars, h1_bars, symbol="UNKNOWN"):
         if h1_curr["high"] > h1_high:
             level = h1_high
             tf = "1H (CRT)"
-            current_close = h1_curr["close"]
             bar_time = h1_curr["timestamp"]
             htf_bars_ref = h1_bars
 
@@ -115,7 +107,6 @@ def detect_sweep(d1_bars, h4_bars, h1_bars, symbol="UNKNOWN"):
         elif h1_curr["low"] < h1_low:
             level = h1_low
             tf = "1H (CRT)"
-            current_close = h1_curr["close"]
             bar_time = h1_curr["timestamp"]
             htf_bars_ref = h1_bars
 
@@ -137,29 +128,32 @@ def detect_sweep(d1_bars, h4_bars, h1_bars, symbol="UNKNOWN"):
         log.info(f"⛔️ [{symbol}] SWEEP проигнорирован: сильный контртрендовый импульс на {tf}.")
         return None
 
+    # Если передана реальная рыночная цена, используем ее, иначе берем close текущего бара
+    active_entry = current_price if current_price is not None and current_price > 0 else h1_curr["close"]
+
     log.info(
         f"🎯 [{symbol}] ОБНАРУЖЕН {setup_type}! "
-        f"Таймфрейм: {tf} | Направление: {direction} | Уровень: {level:.5f} | Цена: {current_close:.5f}"
+        f"Таймфрейм: {tf} | Направление: {direction} | Уровень: {level:.5f} | Цена: {active_entry:.5f}"
     )
 
-    # Расчет Stop-Loss & Targets
+    # Расчет Stop-Loss & Targets с использованием реальной цены входа
     if direction == "SHORT":
-        stop_loss = level + (level * 0.0035) if setup_type == "SWEEP" else current_close + (current_close * 0.004)
-        risk = stop_loss - current_close
-        target_1 = current_close - (risk * 1.5)
-        target_2 = current_close - (risk * 3.5)
+        stop_loss = level + (level * 0.0035) if setup_type == "SWEEP" else active_entry + (active_entry * 0.004)
+        risk = stop_loss - active_entry
+        target_1 = active_entry - (risk * 1.5)
+        target_2 = active_entry - (risk * 3.5)
     else:  # LONG
-        stop_loss = level - (level * 0.0035) if setup_type == "SWEEP" else current_close - (current_close * 0.004)
-        risk = current_close - stop_loss
-        target_1 = current_close + (risk * 1.5)
-        target_2 = current_close + (risk * 3.5)
+        stop_loss = level - (level * 0.0035) if setup_type == "SWEEP" else active_entry - (active_entry * 0.004)
+        risk = active_entry - stop_loss
+        target_1 = active_entry + (risk * 1.5)
+        target_2 = active_entry + (risk * 3.5)
 
     return {
-        "setup_type": setup_type,  # SWEEP или BOS
+        "setup_type": setup_type,
         "direction": direction,
         "tf": tf,
         "level": level,
-        "entry": current_close,    # Актуальная цена закрытия свечи
+        "entry": active_entry,
         "stop_loss": stop_loss,
         "target_1": target_1,
         "target_2": target_2,
@@ -202,7 +196,7 @@ def optimize_sl_tp_on_confirmation(direction, current_price, m5_bars, h1_bars, s
             stop_loss = local_high * (1.0 + buffer_pct)
             risk = stop_loss - current_price
             
-            min_risk = current_price * 0.012 if is_forex else current_price * 0.0025
+            min_risk = current_price * 0.0012 if is_forex else current_price * 0.0025
             if risk < min_risk:
                 local_high_h1 = max([b["high"] for b in h1_bars[-3:]])
                 stop_loss = local_high_h1 * (1.0 + buffer_pct)
