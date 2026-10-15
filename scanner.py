@@ -5,26 +5,21 @@ log = logging.getLogger("liquidity-hunter")
 
 def is_strong_impulse_against(direction, htf_bars):
     """
-    Проверка на агрессивный трендовый импульс на старшем ТФ, 
+    Проверка на агрессивный трендовый импульс на старшем ТФ (4H/1H), 
     чтобы не брать сделки против 'падающего ножа'.
     """
     if len(htf_bars) < 3:
         return False
 
     recent_bars = htf_bars[-3:-1]  # Берем предыдущие сформированные свечи
-    
-    # Считаем средний размер тела свечи
     avg_body = sum([abs(b["close"] - b["open"]) for b in recent_bars]) / len(recent_bars)
     
-    # Проверяем последовательный сильный даунтренды / аптренды
     if direction == "LONG":
-        # Если последние свечи были мощными медвежьими (close < open)
         bearish_count = sum(1 for b in recent_bars if b["close"] < b["open"])
         if bearish_count >= 2 and avg_body > (recent_bars[-1]["high"] - recent_bars[-1]["low"]) * 0.65:
             return True  # Сильный нисходящий импульс, LONG опасен!
             
     elif direction == "SHORT":
-        # Если последние свечи были мощными бычьими (close > open)
         bullish_count = sum(1 for b in recent_bars if b["close"] > b["open"])
         if bullish_count >= 2 and avg_body > (recent_bars[-1]["high"] - recent_bars[-1]["low"]) * 0.65:
             return True  # Сильный восходящий импульс, SHORT опасен!
@@ -34,21 +29,17 @@ def is_strong_impulse_against(direction, htf_bars):
 
 def detect_sweep(d1_bars, h4_bars, h1_bars, symbol="UNKNOWN"):
     """
-    Поиск ликвидности (Liquidity Sweep) по правилам CRT с обязательным 
-    возвратом тела свечи в диапазон и фильтрацией против импульса.
+    Поиск ликвидности (Liquidity Sweep) по правилам CRT исключительно 
+    на 4H и 1H с проверкой закрытия тела внутри диапазона.
     """
-    if not d1_bars or not h4_bars or not h1_bars:
-        log.warning(f"[{symbol}] Отсутствуют бары для одного или нескольких ТФ. Пропуск анализа.")
+    if not h4_bars or not h1_bars:
+        log.warning(f"[{symbol}] Отсутствуют бары для 4H или 1H. Пропуск анализа.")
         return None
 
-    d1_curr = d1_bars[-1]
     h4_curr = h4_bars[-1]
     h1_curr = h1_bars[-1]
 
-    # CRT Диапазоны (границы предыдущих свечей/консолидаций)
-    d1_high = max([b["high"] for b in d1_bars[-21:-1]])
-    d1_low = min([b["low"] for b in d1_bars[-21:-1]])
-
+    # CRT Диапазоны 4H и 1H (границы предыдущих свечей/консолидаций)
     h4_high = max([b["high"] for b in h4_bars[-16:-1]])
     h4_low = min([b["low"] for b in h4_bars[-16:-1]])
 
@@ -62,24 +53,8 @@ def detect_sweep(d1_bars, h4_bars, h1_bars, symbol="UNKNOWN"):
     bar_time = None
     htf_bars_ref = None
 
-    # --- ПРОВЕРКА 1D ---
-    if d1_curr["high"] > d1_high and d1_curr["close"] < d1_high: # Истинный CRT Sweep (тело ВНУТРИ)
-        direction = "SHORT"
-        level = d1_high
-        tf = "1D"
-        current_close = d1_curr["close"]
-        bar_time = d1_curr["timestamp"]
-        htf_bars_ref = d1_bars
-    elif d1_curr["low"] < d1_low and d1_curr["close"] > d1_low:
-        direction = "LONG"
-        level = d1_low
-        tf = "1D"
-        current_close = d1_curr["close"]
-        bar_time = d1_curr["timestamp"]
-        htf_bars_ref = d1_bars
-
-    # --- ПРОВЕРКА 4H ---
-    elif h4_curr["high"] > h4_high and h4_curr["close"] < h4_high:
+    # --- ПРОВЕРКА 4H (Приоритет) ---
+    if h4_curr["high"] > h4_high and h4_curr["close"] < h4_high:
         direction = "SHORT"
         level = h4_high
         tf = "4H (CRT)"
@@ -92,6 +67,7 @@ def detect_sweep(d1_bars, h4_bars, h1_bars, symbol="UNKNOWN"):
         tf = "4H (CRT)"
         current_close = h4_curr["close"]
         bar_time = h4_curr["timestamp"]
+        htf_bars_ref = h4_bars
 
     # --- ПРОВЕРКА 1H ---
     elif h1_curr["high"] > h1_high and h1_curr["close"] < h1_high:
@@ -109,7 +85,7 @@ def detect_sweep(d1_bars, h4_bars, h1_bars, symbol="UNKNOWN"):
         bar_time = h1_curr["timestamp"]
 
     if not direction:
-        log.debug(f"[{symbol}] Истинных CRT манипуляций не обнаружено (тело закрылось за уровнем или не достало).")
+        log.debug(f"[{symbol}] CRT манипуляций на 4H/1H не обнаружено.")
         return None
 
     # ПРОВЕРКА ФИЛЬТРА ИМПУЛЬСА
@@ -148,7 +124,7 @@ def detect_sweep(d1_bars, h4_bars, h1_bars, symbol="UNKNOWN"):
 
 def optimize_sl_tp_on_confirmation(direction, current_price, m5_bars, h1_bars, symbol="UNKNOWN"):
     """
-    Оптимизация стопа с проверкой на свечу расширения (Expansion Candle) 
+    Оптимизация стопа с проверкой на Expansion Candle (свечу расширения M5)
     и защитой от спреда.
     """
     try:
@@ -156,9 +132,8 @@ def optimize_sl_tp_on_confirmation(direction, current_price, m5_bars, h1_bars, s
         candle_range = last_candle["high"] - last_candle["low"]
         body_size = abs(last_candle["close"] - last_candle["open"])
         
-        # Свеча подтверждения должна быть импульсной (тело >= 50% от полного диапазона свечи)
         if candle_range > 0 and (body_size / candle_range) < 0.50:
-            log.info(f"[{symbol}] Отклонено: свеча подтверждения M5 не является Expansion-свечой (слабое тело).")
+            log.info(f"[{symbol}] Отклонено: свеча M5 не является Expansion (слабое тело).")
             return None, None, None, 3.5
 
         is_forex = any(pair in symbol for pair in ["EUR", "GBP", "USD", "AUD", "NZD", "CAD", "JPY"]) and "USDT" not in symbol
