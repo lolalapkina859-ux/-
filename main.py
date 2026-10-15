@@ -19,7 +19,7 @@ log = logging.getLogger("liquidity-hunter")
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
-SCAN_SECONDS = int(os.getenv("SCAN_INTERVAL_SECONDS", "60"))  # 60 секунд для отслеживания M5
+SCAN_SECONDS = int(os.getenv("SCAN_INTERVAL_SECONDS", "60"))  # 60 секунд сканирования
 
 SYMBOLS = {
     # Crypto (BingX)
@@ -51,6 +51,7 @@ SYMBOLS = {
 last_alerts = set()
 symbol_cooldown = {}
 COOLDOWN_SECONDS = 10800  # 3 часа перерыва после подтвержденного сигнала
+PENDING_TIMEOUT = 7200     # 2 часа таймаут для ожидания подтверждения на M5
 
 # Ожидающие подтверждения закрепа на M5
 pending_setups = {}
@@ -59,7 +60,11 @@ pending_setups = {}
 def telegram(message):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     try:
-        response = requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": message}, timeout=15)
+        response = requests.post(
+            url, 
+            json={"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "Markdown"}, 
+            timeout=15
+        )
         response.raise_for_status()
     except Exception:
         log.exception("Telegram delivery failed")
@@ -87,6 +92,27 @@ def fetch_bingx_bars(symbol, interval_str):
     return bars
 
 
+def aggregate_1h_to_4h(h1_bars):
+    """Группировка 1H баров от yfinance в 4H бары."""
+    if not h1_bars:
+        return []
+    
+    h4_bars = []
+    chunk_size = 4
+    for i in range(0, len(h1_bars), chunk_size):
+        chunk = h1_bars[i:i + chunk_size]
+        if not chunk:
+            continue
+        h4_bars.append({
+            "timestamp": chunk[0]["timestamp"],
+            "open": chunk[0]["open"],
+            "high": max(b["high"] for b in chunk),
+            "low": min(b["low"] for b in chunk),
+            "close": chunk[-1]["close"],
+        })
+    return h4_bars
+
+
 def fetch_yfinance_bars(ticker_str, interval_str):
     period_map = {"1d": "350d", "4h": "60d", "1h": "60d", "5m": "7d"}
     period = period_map.get(interval_str, "60d")
@@ -108,13 +134,32 @@ def fetch_yfinance_bars(ticker_str, interval_str):
             "close": float(row["Close"]),
         })
     bars.sort(key=lambda b: b["timestamp"])
+    
+    if interval_str == "4h":
+        return aggregate_1h_to_4h(bars)
+        
     return bars
+
+
+def cleanup_expired_pending(current_time):
+    """Удаление устаревших сетапов, которые не подтвердились за PENDING_TIMEOUT."""
+    to_delete = []
+    for symbol, setup in pending_setups.items():
+        created_at = setup.get("created_at", current_time)
+        if current_time - created_at > PENDING_TIMEOUT:
+            to_delete.append(symbol)
+            log.info(f"⏳ [{symbol}] Сетап отменен: превышено время ожидания M5 подтверждения.")
+            
+    for symbol in to_delete:
+        del pending_setups[symbol]
 
 
 def scan_once():
     log.info("--- Starting scan cycle (Hybrid BingX + YFinance) ---")
     current_time = time.time()
     current_prices = {}
+
+    cleanup_expired_pending(current_time)
 
     for display_symbol, info in SYMBOLS.items():
         try:
@@ -136,7 +181,7 @@ def scan_once():
                     }
                     
                     setup = pending_setups[display_symbol]
-                    level = setup["entry"]  # Ключевой уровень (+CISD / -CISD)
+                    level = setup["entry"]  # Ключевой уровень структуры (+CISD / -CISD)
                     direction = setup["direction"]
 
                     confirmed = False
@@ -148,46 +193,51 @@ def scan_once():
                     if confirmed:
                         log.info(f"⚡️ [{display_symbol}] M5 CONFIRMED! Закрытие {last_m5_close} за уровнем {level}")
                         
-                        # Пересчитываем локальный стоп-лосс с учетом буфера на спред
+                        # Пересчитываем локальный стоп-лосс с учетом буфера на спред и Expansion свечи M5
                         opt_sl, opt_t1, opt_t2, opt_rr = optimize_sl_tp_on_confirmation(
                             direction, last_m5_close, m5, h1, symbol=display_symbol
                         )
+                        
                         if opt_sl:
                             setup["stop_loss"] = opt_sl
                             setup["target_1"] = opt_t1
                             setup["target_2"] = opt_t2
                             setup["rr_ratio"] = opt_rr
 
-                        telegram(format_confirmed_signal(display_symbol, setup, last_m5_close))
-                        
-                        save_signal(
-                            symbol=display_symbol,
-                            tf=setup['tf'],
-                            direction=direction,
-                            entry_price=last_m5_close,
-                            stop_loss=setup['stop_loss'],
-                            target=setup['target_2'],
-                            rr_ratio=setup['rr_ratio']
-                        )
-                        
-                        del pending_setups[display_symbol]
-                        symbol_cooldown[display_symbol] = current_time
-                        continue
+                            # Отправка Telegram алерта с ЧЕСТНОЙ ценой входа (last_m5_close)
+                            telegram(format_confirmed_signal(display_symbol, setup, last_m5_close))
+                            
+                            # Сохранение в БД с ЧЕСТНОЙ ценой входа
+                            save_signal(
+                                symbol=display_symbol,
+                                tf=setup['tf'],
+                                direction=direction,
+                                entry_price=last_m5_close,
+                                stop_loss=setup['stop_loss'],
+                                target=setup['target_2'],
+                                rr_ratio=setup['rr_ratio']
+                            )
+                            
+                            del pending_setups[display_symbol]
+                            symbol_cooldown[display_symbol] = current_time
+                            continue
+                        else:
+                            log.info(f"[{display_symbol}] M5 закрепление пропущено: слабый корпус свечи (не Expansion).")
 
-            # 2. ПОИСК СВИПОВ ПО HTF (1D, 4H, 1H)
+            # 2. ПОИСК СВИПОВ ПО HTF (4H, 1H)
             last_alert_time = symbol_cooldown.get(display_symbol, 0)
             if current_time - last_alert_time < COOLDOWN_SECONDS or display_symbol in pending_setups:
                 continue
 
             if source == "bingx":
                 d1 = fetch_bingx_bars(ticker, "1d")
-                time.sleep(0.2)
+                time.sleep(0.15)
                 h4 = fetch_bingx_bars(ticker, "4h")
-                time.sleep(0.2)
+                time.sleep(0.15)
                 h1 = fetch_bingx_bars(ticker, "1h")
             else:
                 d1 = fetch_yfinance_bars(ticker, "1d")
-                h4 = fetch_yfinance_bars(ticker, "1h")
+                h4 = fetch_yfinance_bars(ticker, "4h")
                 h1 = fetch_yfinance_bars(ticker, "1h")
 
             if h1 and display_symbol not in current_prices:
@@ -199,12 +249,12 @@ def scan_once():
 
             event = detect_sweep(d1, h4, h1, display_symbol)
             if not event:
-                time.sleep(0.2)
+                time.sleep(0.15)
                 continue
 
             key = f"{display_symbol}:{event['tf']}:{event['direction']}:{event['level']:.8f}:{event['bar_time']}"
             if key in last_alerts:
-                time.sleep(0.2)
+                time.sleep(0.15)
                 continue
 
             last_alerts.add(key)
@@ -212,14 +262,15 @@ def scan_once():
             # Отправляем первичный алерт о свипе
             telegram(format_signal(display_symbol, event))
 
-            # Переводим сетап в режим ожидания M5-закрепа
+            # Переводим сетап в режим ожидания M5-закрепа с отметкой времени
+            event["created_at"] = current_time
             pending_setups[display_symbol] = event
             log.info(f"⏳ [{display_symbol}] Свип обнаружен. Ожидаем закрепления на M5...")
 
-            time.sleep(0.3)
+            time.sleep(0.2)
         except Exception as exc:
             log.warning("%s: scan failed: %s", display_symbol, exc)
-            time.sleep(0.3)
+            time.sleep(0.2)
 
     if current_prices:
         check_open_trades(current_prices, telegram)
