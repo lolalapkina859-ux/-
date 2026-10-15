@@ -173,7 +173,20 @@ def scan_once():
                 h1 = fetch_bingx_bars(ticker, "1h") if source == "bingx" else fetch_yfinance_bars(ticker, "1h")
                 
                 if m5 and h1:
-                    last_m5_close = m5[-1]["close"]
+                    # Защита от фантомных шпилек yfinance
+                    if len(m5) >= 2:
+                        raw_m5_close = m5[-1]["close"]
+                        prev_m5_close = m5[-2]["close"]
+                        
+                        price_diff_pct = abs(raw_m5_close - prev_m5_close) / prev_m5_close
+                        if price_diff_pct > 0.015:
+                            log.warning(f"⚠️ [{display_symbol}] Прорыв спреда yfinance! Цена {raw_m5_close} отличается от предыдущей на {price_diff_pct*100:.2f}%. Используем безопасную цену.")
+                            last_m5_close = prev_m5_close
+                        else:
+                            last_m5_close = raw_m5_close
+                    else:
+                        last_m5_close = m5[-1]["close"]
+
                     current_prices[display_symbol] = {
                         "high": m5[-1]["high"],
                         "low": m5[-1]["low"],
