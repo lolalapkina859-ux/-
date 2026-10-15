@@ -139,7 +139,7 @@ def detect_sweep(d1_bars, h4_bars, h1_bars, symbol="UNKNOWN"):
 
     log.info(
         f"🎯 [{symbol}] ОБНАРУЖЕН {setup_type}! "
-        f"Таймфрейм: {tf} | Направление: {direction} | Уровень: {level:.5f}"
+        f"Таймфрейм: {tf} | Направление: {direction} | Уровень: {level:.5f} | Цена: {current_close:.5f}"
     )
 
     # Расчет Stop-Loss & Targets
@@ -159,7 +159,7 @@ def detect_sweep(d1_bars, h4_bars, h1_bars, symbol="UNKNOWN"):
         "direction": direction,
         "tf": tf,
         "level": level,
-        "entry": current_close,
+        "entry": current_close,    # Актуальная цена закрытия свечи
         "stop_loss": stop_loss,
         "target_1": target_1,
         "target_2": target_2,
@@ -202,7 +202,7 @@ def optimize_sl_tp_on_confirmation(direction, current_price, m5_bars, h1_bars, s
             stop_loss = local_high * (1.0 + buffer_pct)
             risk = stop_loss - current_price
             
-            min_risk = current_price * 0.0012 if is_forex else current_price * 0.0025
+            min_risk = current_price * 0.012 if is_forex else current_price * 0.0025
             if risk < min_risk:
                 local_high_h1 = max([b["high"] for b in h1_bars[-3:]])
                 stop_loss = local_high_h1 * (1.0 + buffer_pct)
