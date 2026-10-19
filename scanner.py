@@ -28,14 +28,14 @@ def is_strong_impulse_against(direction, htf_bars):
 
 def detect_macro_range_sweep(h4_bars, h1_bars, symbol="UNKNOWN", current_price=None):
     """
-    Поиск макро-свипов границ торгового диапазона (Macro Range High/Low Sweep)
-    на старших таймфреймах (4H / 1D) с целями на Equilibrium (EQ) и противоположную границу.
+    Улучшенный поиск макро-свипов границ торгового диапазона (Macro Range High/Low Sweep)
+    на старших таймфреймах (4H) с железобетонной проверкой истинных экстремумов.
     """
-    if not h4_bars or len(h4_bars) < 50:
+    if not h4_bars or len(h4_bars) < 80:
         return None
 
-    # Берем широкий срез для определения макро-диапазона (последние 72 бара на 4H)
-    macro_slice = h4_bars[-72:-1]
+    # Берем широкий срез (последние 120 баров на 4H) для поиска ИСТИННЫХ границ диапазона
+    macro_slice = h4_bars[-120:-1]
     macro_high = max([b["high"] for b in macro_slice])
     macro_low = min([b["low"] for b in macro_slice])
     eq_level = (macro_high + macro_low) / 2.0
@@ -47,7 +47,8 @@ def detect_macro_range_sweep(h4_bars, h1_bars, symbol="UNKNOWN", current_price=N
     direction = None
     level = 0.0
 
-    # 1. Свип макро-вершины (Range High Sweep -> Шорт к EQ и Range Low)
+    # 1. Свип ИСТИННОЙ макро-вершины (Range High Sweep -> Шорт)
+    # Строгое условие: хай свечи ДОЛЖЕН превышать абсолютный макро-хай
     if h4_curr["high"] > macro_high and h4_curr["close"] <= macro_high:
         upper_wick = h4_curr["high"] - max(h4_curr["open"], h4_curr["close"])
         body_size = abs(h4_curr["close"] - h4_curr["open"])
@@ -56,7 +57,8 @@ def detect_macro_range_sweep(h4_bars, h1_bars, symbol="UNKNOWN", current_price=N
             direction = "SHORT"
             level = macro_high
 
-    # 2. Свип макро-низа (Range Low Sweep -> Лонг к EQ и Range High)
+    # 2. Свип ИСТИННОГО макро-низа (Range Low Sweep -> Лонг)
+    # Строгое условие: лоу свечи ДОЛЖЕН быть ниже абсолютного макро-лоу
     elif h4_curr["low"] < macro_low and h4_curr["close"] >= macro_low:
         lower_wick = min(h4_curr["open"], h4_curr["close"]) - h4_curr["low"]
         body_size = abs(h4_curr["close"] - h4_curr["open"])
@@ -69,15 +71,14 @@ def detect_macro_range_sweep(h4_bars, h1_bars, symbol="UNKNOWN", current_price=N
         return None
 
     log.info(
-        f"🏛 [{symbol}] ОБНАРУЖЕН MACRO RANGE SWEEP! "
-        f"Направление: {direction} | Граница диапазона: {level:.5f} | EQ: {eq_level:.5f}"
+        f"🏛 [{symbol}] НАСТОЯЩИЙ MACRO RANGE SWEEP! "
+        f"Направление: {direction} | Истинная граница: {level:.5f} | EQ: {eq_level:.5f}"
     )
 
-    # Расчет стопов и целей для диапазона
     if direction == "SHORT":
-        stop_loss = level + (level * 0.005) # Чуть шире для макро-уровней
-        target_1 = eq_level              # Первая цель - середина диапазона (EQ)
-        target_2 = macro_low             # Вторая цель - противоположная граница
+        stop_loss = level + (level * 0.005)
+        target_1 = eq_level
+        target_2 = macro_low
     else:
         stop_loss = level - (level * 0.005)
         target_1 = eq_level
