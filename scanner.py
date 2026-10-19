@@ -26,23 +26,96 @@ def is_strong_impulse_against(direction, htf_bars):
     return False
 
 
+def detect_macro_range_sweep(h4_bars, h1_bars, symbol="UNKNOWN", current_price=None):
+    """
+    Поиск макро-свипов границ торгового диапазона (Macro Range High/Low Sweep)
+    на старших таймфреймах (4H / 1D) с целями на Equilibrium (EQ) и противоположную границу.
+    """
+    if not h4_bars or len(h4_bars) < 50:
+        return None
+
+    # Берем широкий срез для определения макро-диапазона (последние 72 бара на 4H)
+    macro_slice = h4_bars[-72:-1]
+    macro_high = max([b["high"] for b in macro_slice])
+    macro_low = min([b["low"] for b in macro_slice])
+    eq_level = (macro_high + macro_low) / 2.0
+
+    h4_curr = h4_bars[-1]
+    active_entry = current_price if current_price is not None and current_price > 0 else h4_curr["close"]
+
+    setup_type = None
+    direction = None
+    level = 0.0
+
+    # 1. Свип макро-вершины (Range High Sweep -> Шорт к EQ и Range Low)
+    if h4_curr["high"] > macro_high and h4_curr["close"] <= macro_high:
+        upper_wick = h4_curr["high"] - max(h4_curr["open"], h4_curr["close"])
+        body_size = abs(h4_curr["close"] - h4_curr["open"])
+        if upper_wick > 0 and (upper_wick >= body_size * 0.25):
+            setup_type = "MACRO_RANGE_SWEEP"
+            direction = "SHORT"
+            level = macro_high
+
+    # 2. Свип макро-низа (Range Low Sweep -> Лонг к EQ и Range High)
+    elif h4_curr["low"] < macro_low and h4_curr["close"] >= macro_low:
+        lower_wick = min(h4_curr["open"], h4_curr["close"]) - h4_curr["low"]
+        body_size = abs(h4_curr["close"] - h4_curr["open"])
+        if lower_wick > 0 and (lower_wick >= body_size * 0.25):
+            setup_type = "MACRO_RANGE_SWEEP"
+            direction = "LONG"
+            level = macro_low
+
+    if not setup_type:
+        return None
+
+    log.info(
+        f"🏛 [{symbol}] ОБНАРУЖЕН MACRO RANGE SWEEP! "
+        f"Направление: {direction} | Граница диапазона: {level:.5f} | EQ: {eq_level:.5f}"
+    )
+
+    # Расчет стопов и целей для диапазона
+    if direction == "SHORT":
+        stop_loss = level + (level * 0.005) # Чуть шире для макро-уровней
+        target_1 = eq_level              # Первая цель - середина диапазона (EQ)
+        target_2 = macro_low             # Вторая цель - противоположная граница
+    else:
+        stop_loss = level - (level * 0.005)
+        target_1 = eq_level
+        target_2 = macro_high
+
+    return {
+        "setup_type": "MACRO_RANGE_SWEEP",
+        "direction": direction,
+        "tf": "4H (Macro Range)",
+        "level": level,
+        "eq_level": eq_level,
+        "entry": active_entry,
+        "stop_loss": stop_loss,
+        "target_1": target_1,
+        "target_2": target_2,
+        "rr_ratio": 3.0,
+        "bar_time": h4_curr["timestamp"],
+    }
+
+
 def detect_sweep(d1_bars, h4_bars, h1_bars, symbol="UNKNOWN", current_price=None):
     """
-    Однорежимный анализ CRT / SMC:
-    Исключительно Liquidity Sweep -> Разворотный сетап от снятия ликвидности (закол тенью).
-    (Сигналы типа TRUE BOS отключены для исключения распила во флэте).
+    Сначала проверяем глобальный Macro Range Sweep, если нет — ищем локальный CRT Sweep.
     """
+    # Сначала пробуем найти макро-свип диапазона на 4H
+    macro_event = detect_macro_range_sweep(h4_bars, h1_bars, symbol, current_price)
+    if macro_event:
+        return macro_event
+
+    # Локальный поиск по аналогии (1H / 4H CRT Sweep)
     if not h4_bars or not h1_bars:
-        log.warning(f"[{symbol}] Отсутствуют бары для 4H или 1H. Пропуск анализа.")
         return None
 
     h4_curr = h4_bars[-1]
     h1_curr = h1_bars[-1]
 
-    # Границы CRT диапазонов (4H и 1H)
     h4_high = max([b["high"] for b in h4_bars[-16:-1]])
     h4_low = min([b["low"] for b in h4_bars[-16:-1]])
-
     h1_high = max([b["high"] for b in h1_bars[-20:-1]])
     h1_low = min([b["low"] for b in h1_bars[-20:-1]])
 
@@ -52,7 +125,6 @@ def detect_sweep(d1_bars, h4_bars, h1_bars, symbol="UNKNOWN", current_price=None
     bar_time = None
     htf_bars_ref = None
 
-    # --- ПРОВЕРКА 4H SWEEP (Приоритет) ---
     if h4_curr["high"] > h4_high and h4_curr["close"] <= h4_high:
         upper_wick = h4_curr["high"] - max(h4_curr["open"], h4_curr["close"])
         body_size = abs(h4_curr["close"] - h4_curr["open"])
@@ -73,7 +145,6 @@ def detect_sweep(d1_bars, h4_bars, h1_bars, symbol="UNKNOWN", current_price=None
             htf_bars_ref = h4_bars
             direction = "LONG"
 
-    # --- ПРОВЕРКА 1H SWEEP (Если нет 4H) ---
     if not direction:
         if h1_curr["high"] > h1_high and h1_curr["close"] <= h1_high:
             upper_wick = h1_curr["high"] - max(h1_curr["open"], h1_curr["close"])
@@ -95,30 +166,20 @@ def detect_sweep(d1_bars, h4_bars, h1_bars, symbol="UNKNOWN", current_price=None
                 htf_bars_ref = h1_bars
                 direction = "LONG"
 
-    # Если свипа не было, выходим
     if not direction:
         return None
 
-    # Фильтр сильного контртрендового движения
     if is_strong_impulse_against(direction, htf_bars_ref):
-        log.info(f"⛔️ [{symbol}] SWEEP проигнорирован: сильный контртрендовый импульс на {tf}.")
         return None
 
-    # Вход по текущей рыночной цене
     active_entry = current_price if current_price is not None and current_price > 0 else h1_curr["close"]
 
-    log.info(
-        f"🎯 [{symbol}] ОБНАРУЖЕН SWEEP! "
-        f"Таймфрейм: {tf} | Направление: {direction} | Уровень: {level:.5f} | Цена: {active_entry:.5f}"
-    )
-
-    # Расчет начального Stop-Loss & Targets для SWEEP
     if direction == "SHORT":
         stop_loss = level + (level * 0.0035)
         risk = stop_loss - active_entry
         target_1 = active_entry - (risk * 1.5)
         target_2 = active_entry - (risk * 3.5)
-    else:  # LONG
+    else:
         stop_loss = level - (level * 0.0035)
         risk = active_entry - stop_loss
         target_1 = active_entry + (risk * 1.5)
@@ -139,16 +200,12 @@ def detect_sweep(d1_bars, h4_bars, h1_bars, symbol="UNKNOWN", current_price=None
 
 
 def optimize_sl_tp_on_confirmation(direction, current_price, m5_bars, h1_bars, symbol="UNKNOWN"):
-    """
-    Оптимизация стопа с проверкой на Expansion Candle (свечу расширения M5).
-    """
     try:
         last_candle = m5_bars[-1]
         candle_range = last_candle["high"] - last_candle["low"]
         body_size = abs(last_candle["close"] - last_candle["open"])
         
         if candle_range > 0 and (body_size / candle_range) < 0.50:
-            log.info(f"[{symbol}] Отклонено: свеча M5 не является Expansion (слабое тело).")
             return None, None, None, 3.5
 
         is_forex = any(pair in symbol for pair in ["EUR", "GBP", "USD", "AUD", "NZD", "CAD", "JPY"]) and "USDT" not in symbol
@@ -183,37 +240,42 @@ def optimize_sl_tp_on_confirmation(direction, current_price, m5_bars, h1_bars, s
 
         return stop_loss, target_1, target_2, 3.5
     except Exception as e:
-        log.warning(f"Ошибка оптимизации стопа CRT: {e}")
+        log.warning(f"Ошибка оптимизации стопа: {e}")
         return None, None, None, 3.5
 
 
 def format_signal(symbol, event):
-    emoji = "🔴" if event["direction"] == "SHORT" else "🟢"
-    title = "🔴 CRT LIQUIDITY SWEEP 🔴" if event["direction"] == "SHORT" else "🟢 CRT LIQUIDITY SWEEP 🟢"
+    if event.get("setup_type") == "MACRO_RANGE_SWEEP":
+        title = "🏛 MACRO RANGE ZONE SWEEP 🏛"
+        plan_note = f"Макро-свип границы диапазона `{event['level']:.5f}`. Ждем подтверждения на M5."
+    else:
+        title = "🔴 CRT LIQUIDITY SWEEP 🔴" if event["direction"] == "SHORT" else "🟢 CRT LIQUIDITY SWEEP 🟢"
+        plan_note = f"Ждем подтверждения Expansion-свечой на M5 уровня `{event['entry']:.5f}`."
 
     return (
         f"{title}\n\n"
         f"🪙 **Инструмент:** `{symbol}`\n"
         f"⏱ **Таймфрейм:** `{event['tf']}`\n"
-        f"📊 **Тип:** `SWEEP` | **Направление:** `{event['direction']}`\n\n"
-        f"📍 **Пробитый уровень:** `{event['level']:.5f}`\n"
+        f"📊 **Тип:** `{event.get('setup_type', 'SWEEP')}` | **Направление:** `{event['direction']}`\n\n"
+        f"📍 **Ключевой уровень:** `{event['level']:.5f}`\n"
         f"⚡️ **Текущая цена:** `{event['entry']:.5f}`\n\n"
         f"📝 **План торговли:**\n"
-        f"• Ждем подтверждения Expansion-свечой на M5 уровня `{event['entry']:.5f}`.\n\n"
+        f"• {plan_note}\n\n"
         f"🛑 **SL:** `{event['stop_loss']:.5f}`\n"
-        f"🎯 **T1:** `{event['target_1']:.5f}` | 🚀 **T2:** `{event['target_2']:.5f}`\n"
+        f"🎯 **T1 (EQ):** `{event['target_1']:.5f}` | 🚀 **T2:** `{event['target_2']:.5f}`\n"
     )
 
 
 def format_confirmed_signal(symbol, event, current_price):
     emoji = "🟢" if event["direction"] == "LONG" else "🔴"
+    setup_name = "MACRO RANGE SWEEP CONFIRMED" if event.get("setup_type") == "MACRO_RANGE_SWEEP" else "CRT SWEEP EXPANSION"
     return (
-        f"✅ **CRT SWEEP EXPANSION CONFIRMED** ✅\n\n"
+        f"✅ **{setup_name}** ✅\n\n"
         f"{emoji} **Инструмент:** `{symbol}`\n"
         f"📊 **Направление:** `{event['direction']}` (База: `{event['tf']}`)\n"
         f"⚡️ **Подтверждение на M5 зафиксировано!**\n\n"
         f"📍 **Вход:** `{current_price:.5f}`\n"
         f"🛑 **Стоп-лосс:** `{event['stop_loss']:.5f}`\n"
         f"🎯 **T1:** `{event['target_1']:.5f}` | **T2:** `{event['target_2']:.5f}`\n\n"
-        f"🚀 _Вход по правилам CRT & SMC готов!_"
+        f"🚀 _Вход по правилам Macro Range & SMC готов!_"
     )
