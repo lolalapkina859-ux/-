@@ -206,7 +206,7 @@ def optimize_sl_tp_on_confirmation(direction, current_price, m5_bars, h1_bars, s
         return stop_loss, target_1, target_2, 3.5
     except Exception as e:
         log.warning(f"Ошибка оптимизации стопа с CHoCH: {e}")
-        return None, None, None, 3.5
+        return None, None, None, 3.5 
 
 
 def format_signal(symbol, event):
