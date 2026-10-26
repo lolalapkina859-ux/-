@@ -8,17 +8,6 @@ log = logging.getLogger("liquidity-hunter")
 # 1. ТЕХНИЧЕСКИЕ ИНДИКАТОРЫ И ВПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
 # ==========================================
 
-def calculate_ema(bars, period=200):
-    """Расчет экспоненциальной скользящей средней (EMA) для трендового фильтра."""
-    if not bars or len(bars) < period:
-        return None
-    closes = [b["close"] for b in bars]
-    multiplier = 2 / (period + 1)
-    ema = sum(closes[:period]) / period
-    for close in closes[period:]:
-        ema = (close - ema) * multiplier + ema
-    return ema
-
 
 def calculate_atr(bars, period=14):
     """Расчет Average True Range (ATR) для динамических стопов."""
