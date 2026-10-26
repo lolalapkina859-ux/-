@@ -2,14 +2,23 @@ import os
 import time
 import logging
 import requests
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
 import yfinance as yf
 from scanner import (
     detect_sweep, 
     format_signal, 
     format_confirmed_signal, 
-    optimize_sl_tp_on_confirmation
+    optimize_sl_tp_on_confirmation,
+    calculate_daily_bias,
+    get_quarterly_phase,
+    calculate_range_dynamics,
+    calculate_dol_levels,
+    find_ocl_levels,
+    find_order_blocks,
+    find_fvg,
+    detect_quasimodo_patterns,
+    find_inducement
 )
 from tracker import init_db, save_signal, check_open_trades
 
@@ -19,43 +28,26 @@ log = logging.getLogger("liquidity-hunter")
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
-SCAN_SECONDS = int(os.getenv("SCAN_INTERVAL_SECONDS", "60"))  # 60 секунд сканирования
+SCAN_SECONDS = int(os.getenv("SCAN_INTERVAL_SECONDS", "60"))
 
 SYMBOLS = {
-    # Crypto (BingX)
+    "DXY": {"source": "yfinance", "ticker": "DX-Y.NYB"},
     "BTC / USDT": {"source": "bingx", "ticker": "BTC-USDT"},
     "ETH / USDT": {"source": "bingx", "ticker": "ETH-USDT"},
     "SOL / USDT": {"source": "bingx", "ticker": "SOL-USDT"},
-
-    # Commodities & Metals (yfinance)
     "XAU / USD": {"source": "yfinance", "ticker": "XAUT-USD"},
     "XAG / USD": {"source": "yfinance", "ticker": "SI=F"},
     "USOIL / USD": {"source": "yfinance", "ticker": "CL=F"},
-
-    # Indices (yfinance)
     "US500 / USD": {"source": "yfinance", "ticker": "SPY"},
-    "NAS100 / USD": {"source": "yfinance", "ticker": "NQ=F"},
-    "GER40 / EUR": {"source": "yfinance", "ticker": "^GDAXI"},
-
-    # Forex Majors & Crosses (yfinance)
     "EUR / USD": {"source": "yfinance", "ticker": "EURUSD=X"},
     "GBP / USD": {"source": "yfinance", "ticker": "GBPUSD=X"},
     "USD / JPY": {"source": "yfinance", "ticker": "USDJPY=X"},
-    "GBP / JPY": {"source": "yfinance", "ticker": "GBPJPY=X"},
-    "EUR / JPY": {"source": "yfinance", "ticker": "EURJPY=X"},
-    "USD / CAD": {"source": "yfinance", "ticker": "USDCAD=X"},
-    "NZD / USD": {"source": "yfinance", "ticker": "NZDUSD=X"},
-    "AUD / USD": {"source": "yfinance", "ticker": "AUDUSD=X"},
-    "EUR / GBP": {"source": "yfinance", "ticker": "EURGBP=X"},
-    "USD / CHF": {"source": "yfinance", "ticker": "USDCHF=X"},
 }
 
 last_alerts = set()
 symbol_cooldown = {}
-COOLDOWN_SECONDS = 10800  # 3 часа перерыва после подтвержденного сигнала
-PENDING_TIMEOUT = 7200     # 2 часа таймаут для ожидания подтверждения на M5
-
-# Ожидающие подтверждения закрепа на M5
+COOLDOWN_SECONDS = 10800  
+PENDING_TIMEOUT = 7200     
 pending_setups = {}
 
 
@@ -95,10 +87,8 @@ def fetch_bingx_bars(symbol, interval_str):
 
 
 def aggregate_1h_to_4h(h1_bars):
-    """Группировка 1H баров от yfinance в 4H бары."""
     if not h1_bars:
         return []
-    
     h4_bars = []
     chunk_size = 4
     for i in range(0, len(h1_bars), chunk_size):
@@ -116,10 +106,17 @@ def aggregate_1h_to_4h(h1_bars):
 
 
 def fetch_yfinance_bars(ticker_str, interval_str):
-    period_map = {"1d": "350d", "4h": "60d", "1h": "60d", "5m": "7d"}
+    period_map = {"1d": "350d", "4h": "60d", "1h": "60d", "15m": "14d", "5m": "7d"}
     period = period_map.get(interval_str, "60d")
     
-    yf_interval = "1d" if interval_str == "1d" else ("5m" if interval_str == "5m" else "1h")
+    if interval_str == "1d":
+        yf_interval = "1d"
+    elif interval_str == "15m":
+        yf_interval = "15m"
+    elif interval_str == "5m":
+        yf_interval = "5m"
+    else:
+        yf_interval = "1h"
     
     df = yf.download(ticker_str, period=period, interval=yf_interval, progress=False)
     if df.empty:
@@ -139,130 +136,198 @@ def fetch_yfinance_bars(ticker_str, interval_str):
     
     if interval_str == "4h":
         return aggregate_1h_to_4h(bars)
-        
     return bars
 
 
+def get_macro_news_narrative():
+    local_tz = timezone(timedelta(hours=3))
+    raw_events = [
+        {"day": "Среда, 28 окт", "utc_hour": 21, "utc_min": 0, "event": "API / Crude Oil Inventories", "impact": "Medium"},
+        {"day": "Четверг, 29 окт", "utc_hour": 1, "utc_min": 0, "event": "Federal Funds Rate & FOMC Statement", "impact": "HIGH 🔴"},
+        {"day": "Четверг, 29 окт", "utc_hour": 1, "utc_min": 30, "event": "FOMC Press Conference", "impact": "HIGH 🔴"},
+        {"day": "Четверг, 29 окт", "utc_hour": 12, "utc_min": 30, "event": "Advance GDP q/q & Core PCE Price Index", "impact": "HIGH 🔴"},
+    ]
+    
+    narrative = f"📰 **Макро-наратив (Ваше локальное время):**\n"
+    for ev in raw_events:
+        utc_dt = datetime.now(timezone.utc).replace(hour=ev["utc_hour"], minute=ev["utc_min"], second=0, microsecond=0)
+        local_dt = utc_dt.astimezone(local_tz)
+        time_str = local_dt.strftime("%H:%M")
+        narrative += f"• `{ev['day']} в {time_str}` — {ev['event']} [{ev['impact']}]\n"
+    narrative += f"⚠️ _В период выхода этих новостей возможны резкие сквизы._\n"
+    return narrative
+
+
+def send_gold_morning_analysis():
+    log.info("🌟 Выполнение утреннего анализа по золоту (XAU/USD) и DXY...")
+    gold_info = SYMBOLS.get("XAU / USD")
+    dxy_info = SYMBOLS.get("DXY")
+    if not gold_info:
+        return
+
+    try:
+        dxy_price = 0.0
+        if dxy_info:
+            dxy_bars = fetch_yfinance_bars(dxy_info["ticker"], "1h")
+            if dxy_bars:
+                dxy_price = dxy_bars[-1]["close"]
+
+        ticker = gold_info["ticker"]
+        d1 = fetch_yfinance_bars(ticker, "1d")
+        h4 = fetch_yfinance_bars(ticker, "4h")
+        h1 = fetch_yfinance_bars(ticker, "1h")
+        
+        if not d1 or not h4 or not h1:
+            return
+
+        bias = calculate_daily_bias(d1, h4)
+        qt_phase = get_quarterly_phase()
+        
+        # Переключаем расчет диапазона на локальный часовой таймфрейм (window=24 баров / сутки)
+        rd = calculate_range_dynamics(h1, window=24)
+        
+        dol = calculate_dol_levels(d1)
+        ocl_levels = find_ocl_levels(h4)
+        obs = find_order_blocks(h4)
+        current_gold_price = h1[-1]["close"] if h1 else 0.0
+
+        report = (
+            f"🥇 **ЛОКАЛЬНЫЙ АНАЛИЗ GOLD (XAU/USD)** 🥇\n\n"
+            f"💵 **Текущая цена золота:** `{current_gold_price:.2f}`\n"
+            f"💵 **Индекс доллара (DXY):** `{dxy_price:.2f}`\n"
+            f"📅 **Daily Bias:** `{bias}`\n"
+            f"⌛ **QT Phase:** `{qt_phase}`\n\n"
+        )
+
+        if rd:
+            report += (
+                f"📊 **Локальный Dealing Range (1H):**\n"
+                f"• Local High (Premium): `{rd['range_high']:.2f}`\n"
+                f"• Local Low (Discount): `{rd['range_low']:.2f}`\n"
+                f"• Equilibrium (50% EQ): `{rd['eq_level']:.2f}`\n\n"
+            )
+
+        if dol:
+            report += f"🎯 **Цели ликвидности (DOL):**\n• PDH: `{dol.get('PDH', 0):.2f}` | PDL: `{dol.get('PDL', 0):.2f}`\n\n"
+
+        if obs:
+            report += f"📦 **Order Block (4H/1H):** `{obs[-1]['type']}` (`{obs[-1]['bottom']:.2f} — {obs[-1]['top']:.2f}`)\n"
+
+        report += f"\n{get_macro_news_narrative()}\n"
+
+        report += (
+            f"📍 **РАБОЧИЙ ПЛАН (Внутри дня):**\n"
+            f"• Отслеживаем реакцию цены внутри локального диапазона 1H.\n"
+            f"• Ищем точки входа (FVG / OB + CHoCH на M5) при подходе к локальным границам Premium/Discount, не дожидаясь далеких макро-уровней."
+        )
+
+        telegram(report)
+        log.info("Локальный отчет по золоту отправлен.")
+    except Exception as e:
+        log.exception(f"Ошибка локального анализа золота/DXY: {e}")
+
+
+def send_btc_morning_analysis():
+    log.info("🌟 Выполнение анализа по BTC/...")
+    btc_info = SYMBOLS.get("BTC / USDT")
+    if not btc_info:
+        return
+
+    ticker = btc_info["ticker"]
+    try:
+        d1 = fetch_bingx_bars(ticker, "1d")
+        h4 = fetch_bingx_bars(ticker, "4h")
+        h1 = fetch_bingx_bars(ticker, "1h")
+        
+        if not d1 or not h4 or not h1:
+            return
+
+        bias = calculate_daily_bias(d1, h4)
+        qt_phase = get_quarterly_phase()
+        rd = calculate_range_dynamics(h1, window=24)
+        dol = calculate_dol_levels(d1)
+        obs = find_order_blocks(h4)
+        current_btc_price = h1[-1]["close"] if h1 else 0.0
+
+        report = (
+            f"🟠 **ЛОКАЛЬНЫЙ АНАЛИЗ BITCOIN (BTC/USDT)** 🟠\n\n"
+            f"💵 **Текущая цена:** `{current_btc_price:.2f}`\n"
+            f"📅 **Daily Bias:** `{bias}`\n"
+            f"⌛ **QT Phase:** `{qt_phase}`\n\n"
+        )
+
+        if rd:
+            report += (
+                f"📊 **Локальный Dealing Range (1H):**\n"
+                f"• Local High (Premium): `{rd['range_high']:.2f}`\n"
+                f"• Local Low (Discount): `{rd['range_low']:.2f}`\n"
+                f"• Equilibrium (EQ): `{rd['eq_level']:.2f}`\n\n"
+            )
+
+        telegram(report)
+        log.info("Локальный отчет по BTC отправлен.")
+    except Exception as e:
+        log.exception(f"Ошибка анализа BTC: {e}")
+
+
 def cleanup_expired_pending(current_time):
-    """Удаление устаревших сетапов, которые не подтвердились за PENDING_TIMEOUT."""
     to_delete = []
     for symbol, setup in pending_setups.items():
-        created_at = setup.get("created_at", current_time)
-        if current_time - created_at > PENDING_TIMEOUT:
+        if current_time - setup.get("created_at", current_time) > PENDING_TIMEOUT:
             to_delete.append(symbol)
-            log.info(f"⏳ [{symbol}] Сетап отменен: превышено время ожидания M5 подтверждения.")
-            
     for symbol in to_delete:
         del pending_setups[symbol]
 
 
 def scan_once():
-    log.info("--- Starting scan cycle (Hybrid BingX + YFinance) ---")
+    log.info("--- Starting scan cycle ---")
     current_time = time.time()
     current_prices = {}
-
     cleanup_expired_pending(current_time)
 
     for display_symbol, info in SYMBOLS.items():
+        if display_symbol == "DXY":
+            continue
+
         try:
             source = info["source"]
             ticker = info["ticker"]
 
-            # 1. ПРОВЕРКА ПОДТВЕРЖДЕНИЯ НА M5 (Быстрый вход и оптимизация стопа)
             if display_symbol in pending_setups:
-                log.info("Checking M5 confirmation for %s...", display_symbol)
                 m5 = fetch_bingx_bars(ticker, "5m") if source == "bingx" else fetch_yfinance_bars(ticker, "5m")
                 h1 = fetch_bingx_bars(ticker, "1h") if source == "bingx" else fetch_yfinance_bars(ticker, "1h")
-                
                 if m5 and h1:
-                    # Защита от фантомных шпилек yfinance
-                    if len(m5) >= 2:
-                        raw_m5_close = m5[-1]["close"]
-                        prev_m5_close = m5[-2]["close"]
-                        
-                        price_diff_pct = abs(raw_m5_close - prev_m5_close) / prev_m5_close
-                        if price_diff_pct > 0.015:
-                            log.warning(f"⚠️ [{display_symbol}] Прорыв спреда yfinance! Цена {raw_m5_close} отличается от предыдущей на {price_diff_pct*100:.2f}%. Используем безопасную цену.")
-                            last_m5_close = prev_m5_close
-                        else:
-                            last_m5_close = raw_m5_close
-                    else:
-                        last_m5_close = m5[-1]["close"]
-
-                    current_prices[display_symbol] = {
-                        "high": m5[-1]["high"],
-                        "low": m5[-1]["low"],
-                        "close": last_m5_close
-                    }
-                    
+                    last_m5_close = m5[-1]["close"]
+                    current_prices[display_symbol] = {"high": m5[-1]["high"], "low": m5[-1]["low"], "close": last_m5_close}
                     setup = pending_setups[display_symbol]
-                    level = setup["entry"]  # Ключевой уровень структуры (+CISD / -CISD)
-                    direction = setup["direction"]
-
-                    confirmed = False
-                    if direction == "LONG" and last_m5_close > level:
-                        confirmed = True
-                    elif direction == "SHORT" and last_m5_close < level:
-                        confirmed = True
+                    
+                    confirmed = (setup["direction"] == "LONG" and last_m5_close > setup["entry"]) or \
+                                (setup["direction"] == "SHORT" and last_m5_close < setup["entry"])
 
                     if confirmed:
-                        log.info(f"⚡️ [{display_symbol}] M5 CONFIRMED! Закрытие {last_m5_close} за уровнем {level}")
-                        
-                        # Пересчитываем локальный стоп-лосс с учетом буфера на спред и Expansion свечи M5
                         opt_sl, opt_t1, opt_t2, opt_rr = optimize_sl_tp_on_confirmation(
-                            direction, last_m5_close, m5, h1, symbol=display_symbol
+                            setup["direction"], last_m5_close, m5, h1, symbol=display_symbol
                         )
-                        
                         if opt_sl:
-                            setup["stop_loss"] = opt_sl
-                            setup["target_1"] = opt_t1
-                            setup["target_2"] = opt_t2
-                            setup["rr_ratio"] = opt_rr
-
-                            # Отправка Telegram алерта с ЧЕСТНОЙ ценой входа (last_m5_close)
+                            setup.update({"stop_loss": opt_sl, "target_1": opt_t1, "target_2": opt_t2, "rr_ratio": opt_rr})
                             telegram(format_confirmed_signal(display_symbol, setup, last_m5_close))
-                            
-                            # Сохранение в БД с ЧЕСТНОЙ ценой входа
-                            save_signal(
-                                symbol=display_symbol,
-                                tf=setup['tf'],
-                                direction=direction,
-                                entry_price=last_m5_close,
-                                stop_loss=setup['stop_loss'],
-                                target=setup['target_2'],
-                                rr_ratio=setup['rr_ratio']
-                            )
-                            
+                            save_signal(display_symbol, setup['tf'], setup['direction'], last_m5_close, opt_sl, opt_t2, opt_rr)
                             del pending_setups[display_symbol]
                             symbol_cooldown[display_symbol] = current_time
                             continue
-                        else:
-                            log.info(f"[{display_symbol}] M5 закрепление пропущено: слабый корпус свечи (не Expansion).")
 
-            # 2. ПОИСК СВИПОВ ПО HTF (4H, 1H)
-            last_alert_time = symbol_cooldown.get(display_symbol, 0)
-            if current_time - last_alert_time < COOLDOWN_SECONDS or display_symbol in pending_setups:
+            if current_time - symbol_cooldown.get(display_symbol, 0) < COOLDOWN_SECONDS or display_symbol in pending_setups:
                 continue
 
-            if source == "bingx":
-                d1 = fetch_bingx_bars(ticker, "1d")
-                time.sleep(0.15)
-                h4 = fetch_bingx_bars(ticker, "4h")
-                time.sleep(0.15)
-                h1 = fetch_bingx_bars(ticker, "1h")
-            else:
-                d1 = fetch_yfinance_bars(ticker, "1d")
-                h4 = fetch_yfinance_bars(ticker, "4h")
-                h1 = fetch_yfinance_bars(ticker, "1h")
+            d1 = fetch_bingx_bars(ticker, "1d") if source == "bingx" else fetch_yfinance_bars(ticker, "1d")
+            time.sleep(0.15)
+            h4 = fetch_bingx_bars(ticker, "4h") if source == "bingx" else fetch_yfinance_bars(ticker, "4h")
+            time.sleep(0.15)
+            h1 = fetch_bingx_bars(ticker, "1h") if source == "bingx" else fetch_yfinance_bars(ticker, "1h")
 
-            current_market_price = None
+            current_market_price = h1[-1]["close"] if h1 else None
             if h1:
-                current_market_price = h1[-1]["close"]
-                current_prices[display_symbol] = {
-                    "high": h1[-1]["high"],
-                    "low": h1[-1]["low"],
-                    "close": current_market_price
-                }
+                current_prices[display_symbol] = {"high": h1[-1]["high"], "low": h1[-1]["low"], "close": current_market_price}
 
             event = detect_sweep(d1, h4, h1, display_symbol, current_price=current_market_price)
             if not event:
@@ -275,15 +340,9 @@ def scan_once():
                 continue
 
             last_alerts.add(key)
-            
-            # Отправляем первичный алерт о свипе
             telegram(format_signal(display_symbol, event))
-
-            # Переводим сетап в режим ожидания M5-закрепа с отметкой времени
             event["created_at"] = current_time
             pending_setups[display_symbol] = event
-            log.info(f"⏳ [{display_symbol}] Свип обнаружен. Ожидаем закрепления на M5...")
-
             time.sleep(0.2)
         except Exception as exc:
             log.warning("%s: scan failed: %s", display_symbol, exc)
@@ -291,16 +350,18 @@ def scan_once():
 
     if current_prices:
         check_open_trades(current_prices, telegram)
-
     log.info("--- Scan cycle finished ---")
 
 
 def main():
     if not all([TELEGRAM_TOKEN, TELEGRAM_CHAT_ID]):
         raise SystemExit("Missing Telegram env vars.")
-    
     init_db()
     log.info("Database initialized successfully.")
+    
+    send_gold_morning_analysis()
+    time.sleep(2)
+    send_btc_morning_analysis()
     
     while True:
         scan_once()
