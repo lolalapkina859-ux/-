@@ -1,3 +1,7 @@
+import warnings
+warnings.simplefilter(action='ignore', category=FutureWarning)
+warnings.filterwarnings('ignore', category=UserWarning, module='yfinance')
+
 import os
 import time
 import logging
@@ -41,7 +45,7 @@ SYMBOLS = {
 last_alerts = set()
 symbol_cooldown = {}
 COOLDOWN_SECONDS = 1800  # 30 минут кулдаун
-PENDING_TIMEOUT = 900     # 15 минут на отработку сетапа
+PENDING_TIMEOUT = 900     # 15 минут на сброс зависшего сетапа
 pending_setups = {}
 
 
@@ -210,6 +214,48 @@ def send_gold_morning_analysis():
         log.exception(f"Ошибка анализа золота: {e}")
 
 
+def send_btc_morning_analysis():
+    log.info("🌟 Утренний анализ по BTC/USDT...")
+    btc_info = SYMBOLS.get("BTC / USDT")
+    if not btc_info:
+        return
+
+    ticker = btc_info["ticker"]
+    try:
+        d1 = fetch_bingx_bars(ticker, "1d")
+        h4 = fetch_bingx_bars(ticker, "4h")
+        h1 = fetch_bingx_bars(ticker, "1h")
+        
+        if not d1 or not h4 or not h1:
+            return
+
+        bias = calculate_daily_bias(d1, h4)
+        qt_phase = get_quarterly_phase()
+        rd = calculate_range_dynamics(h1, window=24)
+        dol = calculate_dol_levels(d1)
+        current_btc_price = h1[-1]["close"] if h1 else 0.0
+
+        report = (
+            f"🟠 **ПРИНЦИП PRICE ACTION: BITCOIN (BTC/USDT)** 🟠\n\n"
+            f"💵 **Текущая цена:** `{current_btc_price:.2f}`\n"
+            f"📅 **Daily Bias:** `{bias}`\n"
+            f"⌛ **QT Phase:** `{qt_phase}`\n\n"
+        )
+
+        if rd:
+            report += (
+                f"📊 **Локальный Dealing Range (1H):**\n"
+                f"• Local High (Premium): `{rd['range_high']:.2f}`\n"
+                f"• Local Low (Discount): `{rd['range_low']:.2f}`\n"
+                f"• Equilibrium (EQ): `{rd['eq_level']:.2f}`\n\n"
+            )
+
+        telegram(report)
+        log.info("Локальный отчет по BTC отправлен.")
+    except Exception as e:
+        log.exception(f"Ошибка анализа BTC: {e}")
+
+
 def cleanup_expired_pending(current_time):
     to_delete = []
     for symbol, setup in pending_setups.items():
@@ -248,7 +294,6 @@ def scan_once():
             if h1:
                 current_prices[display_symbol] = {"high": h1[-1]["high"], "low": h1[-1]["low"], "close": current_market_price}
 
-            # Детектим свип ликвидности + структура
             event = detect_sweep(d1, h4, h1, display_symbol, current_price=current_market_price)
             if not event:
                 continue
@@ -259,18 +304,15 @@ def scan_once():
 
             last_alerts.add(key)
             
-            # Упрощенный расчет стопа и целей прямо по свечам M5 (без жестких FVG)
             direction = event["direction"]
             entry_price = current_market_price
             
             if direction == "SHORT":
-                # Стоп за локальный хай последних свечей M5 (экстремум закола)
                 stop_loss = max(b["high"] for b in m5[-10:]) + 0.5
-                target = entry_price - (stop_loss - entry_price) * 2  # RR 1:2
+                target = entry_price - (stop_loss - entry_price) * 2
             else:
-                # Стоп за локальный лоу последних свечей M5
                 stop_loss = min(b["low"] for b in m5[-10:]) - 0.5
-                target = entry_price + (entry_price - stop_loss) * 2  # RR 1:2
+                target = entry_price + (entry_price - stop_loss) * 2
 
             signal_msg = (
                 f"🚨 **PRICE ACTION SIGNAL: {display_symbol}** 🚨\n\n"
@@ -304,6 +346,7 @@ def main():
     
     send_gold_morning_analysis()
     time.sleep(2)
+    send_btc_morning_analysis()
     
     while True:
         scan_once()
