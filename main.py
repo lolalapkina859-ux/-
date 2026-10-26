@@ -1,6 +1,12 @@
 import warnings
 warnings.simplefilter(action='ignore', category=FutureWarning)
 warnings.filterwarnings('ignore', category=UserWarning, module='yfinance')
+warnings.filterwarnings('ignore', message='.*inplace keyword.*')
+try:
+    from pandas.errors import Pandas4Warning
+    warnings.simplefilter('ignore', category=Pandas4Warning)
+except ImportError:
+    pass
 
 import os
 import time
@@ -307,20 +313,24 @@ def scan_once():
             direction = event["direction"]
             entry_price = current_market_price
             
+            # Адаптивный буфер за экстремум M5 (исключает факапы на форексе)
+            is_forex = display_symbol in ["EUR / USD", "GBP / USD", "USD / JPY"]
+            buffer = 0.0015 if is_forex else 0.5
+            
             if direction == "SHORT":
-                stop_loss = max(b["high"] for b in m5[-10:]) + 0.5
+                stop_loss = max(b["high"] for b in m5[-10:]) + buffer
                 target = entry_price - (stop_loss - entry_price) * 2
             else:
-                stop_loss = min(b["low"] for b in m5[-10:]) - 0.5
+                stop_loss = min(b["low"] for b in m5[-10:]) - buffer
                 target = entry_price + (entry_price - stop_loss) * 2
 
             signal_msg = (
                 f"🚨 **PRICE ACTION SIGNAL: {display_symbol}** 🚨\n\n"
                 f"📈 Направление: `{direction}`\n"
                 f"🎯 Триггер: Снятие ликвидности + Слом структуры (Shift)\n"
-                f"💵 Цена входа: `{entry_price:.2f}`\n"
-                f"🛡 Стоп-Лосс (SL): `{stop_loss:.2f}`\n"
-                f"🎯 Тейк-Профит (TP): `{target:.2f}`\n"
+                f"💵 Цена входа: `{entry_price:.5f}`\n"
+                f"🛡 Стоп-Лосс (SL): `{stop_loss:.5f}`\n"
+                f"🎯 Тейк-Профит (TP): `{target:.5f}`\n"
                 f"⏱ Время: {datetime.now(timezone(timedelta(hours=3))).strftime('%H:%M:%S')}"
             )
 
