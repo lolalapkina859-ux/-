@@ -46,8 +46,10 @@ SYMBOLS = {
 
 last_alerts = set()
 symbol_cooldown = {}
-COOLDOWN_SECONDS = 10800  
-PENDING_TIMEOUT = 7200     
+
+# УМЕНЬШЕННЫЕ КРИТЕРИИ ДЛЯ ЧАСТЫХ СИГНАЛОВ:
+COOLDOWN_SECONDS = 1800  # Снизили с 3 часов до 30 минут
+PENDING_TIMEOUT = 900     # Снизили с 2 часов до 15 минут, чтобы зависшие сетапы быстро сбрасывались
 pending_setups = {}
 
 
@@ -182,10 +184,7 @@ def send_gold_morning_analysis():
 
         bias = calculate_daily_bias(d1, h4)
         qt_phase = get_quarterly_phase()
-        
-        # Переключаем расчет диапазона на локальный часовой таймфрейм (window=24 баров / сутки)
         rd = calculate_range_dynamics(h1, window=24)
-        
         dol = calculate_dol_levels(d1)
         ocl_levels = find_ocl_levels(h4)
         obs = find_order_blocks(h4)
@@ -214,11 +213,10 @@ def send_gold_morning_analysis():
             report += f"📦 **Order Block (4H/1H):** `{obs[-1]['type']}` (`{obs[-1]['bottom']:.2f} — {obs[-1]['top']:.2f}`)\n"
 
         report += f"\n{get_macro_news_narrative()}\n"
-
         report += (
             f"📍 **РАБОЧИЙ ПЛАН (Внутри дня):**\n"
             f"• Отслеживаем реакцию цены внутри локального диапазона 1H.\n"
-            f"• Ищем точки входа (FVG / OB + CHoCH на M5) при подходе к локальным границам Premium/Discount, не дожидаясь далеких макро-уровней."
+            f"• Ищем точки входа (FVG / OB + CHoCH на M5) при подходе к локальным границам."
         )
 
         telegram(report)
@@ -228,7 +226,7 @@ def send_gold_morning_analysis():
 
 
 def send_btc_morning_analysis():
-    log.info("🌟 Выполнение анализа по BTC/...")
+    log.info("🌟 Выполнение анализа по BTC...")
     btc_info = SYMBOLS.get("BTC / USDT")
     if not btc_info:
         return
