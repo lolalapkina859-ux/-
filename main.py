@@ -9,16 +9,10 @@ from scanner import (
     detect_sweep, 
     format_signal, 
     format_confirmed_signal, 
-    optimize_sl_tp_on_confirmation,
     calculate_daily_bias,
     get_quarterly_phase,
     calculate_range_dynamics,
-    calculate_dol_levels,
-    find_ocl_levels,
-    find_order_blocks,
-    find_fvg,
-    detect_quasimodo_patterns,
-    find_inducement
+    calculate_dol_levels
 )
 from tracker import init_db, save_signal, check_open_trades
 
@@ -46,10 +40,8 @@ SYMBOLS = {
 
 last_alerts = set()
 symbol_cooldown = {}
-
-# УМЕНЬШЕННЫЕ КРИТЕРИИ ДЛЯ ЧАСТЫХ СИГНАЛОВ:
-COOLDOWN_SECONDS = 1800  # Снизили с 3 часов до 30 минут
-PENDING_TIMEOUT = 900     # Снизили с 2 часов до 15 минут, чтобы зависшие сетапы быстро сбрасывались
+COOLDOWN_SECONDS = 1800  # 30 минут кулдаун
+PENDING_TIMEOUT = 900     # 15 минут на отработку сетапа
 pending_setups = {}
 
 
@@ -161,7 +153,7 @@ def get_macro_news_narrative():
 
 
 def send_gold_morning_analysis():
-    log.info("🌟 Выполнение утреннего анализа по золоту (XAU/USD) и DXY...")
+    log.info("🌟 Утренний анализ по золоту (XAU/USD) и DXY...")
     gold_info = SYMBOLS.get("XAU / USD")
     dxy_info = SYMBOLS.get("DXY")
     if not gold_info:
@@ -186,86 +178,36 @@ def send_gold_morning_analysis():
         qt_phase = get_quarterly_phase()
         rd = calculate_range_dynamics(h1, window=24)
         dol = calculate_dol_levels(d1)
-        ocl_levels = find_ocl_levels(h4)
-        obs = find_order_blocks(h4)
         current_gold_price = h1[-1]["close"] if h1 else 0.0
 
         report = (
-            f"🥇 **ЛОКАЛЬНЫЙ АНАЛИЗ GOLD (XAU/USD)** 🥇\n\n"
-            f"💵 **Текущая цена золота:** `{current_gold_price:.2f}`\n"
+            f"🥇 **ПРИНЦИП PRICE ACTION: GOLD (XAU/USD)** 🥇\n\n"
+            f"💵 **Текущая цена:** `{current_gold_price:.2f}`\n"
             f"💵 **Индекс доллара (DXY):** `{dxy_price:.2f}`\n"
-            f"📅 **Daily Bias:** `{bias}`\n"
-            f"⌛ **QT Phase:** `{qt_phase}`\n\n"
+            f"📅 **Bias:** `{bias}` | ⌛ **QT:** `{qt_phase}`\n\n"
         )
 
         if rd:
             report += (
-                f"📊 **Локальный Dealing Range (1H):**\n"
-                f"• Local High (Premium): `{rd['range_high']:.2f}`\n"
-                f"• Local Low (Discount): `{rd['range_low']:.2f}`\n"
-                f"• Equilibrium (50% EQ): `{rd['eq_level']:.2f}`\n\n"
+                f"📊 **Локальный диапазон 1H:**\n"
+                f"• High: `{rd['range_high']:.2f}` | Low: `{rd['range_low']:.2f}`\n"
+                f"• EQ (50%): `{rd['eq_level']:.2f}`\n\n"
             )
 
         if dol:
             report += f"🎯 **Цели ликвидности (DOL):**\n• PDH: `{dol.get('PDH', 0):.2f}` | PDL: `{dol.get('PDL', 0):.2f}`\n\n"
 
-        if obs:
-            report += f"📦 **Order Block (4H/1H):** `{obs[-1]['type']}` (`{obs[-1]['bottom']:.2f} — {obs[-1]['top']:.2f}`)\n"
-
         report += f"\n{get_macro_news_narrative()}\n"
         report += (
-            f"📍 **РАБОЧИЙ ПЛАН (Внутри дня):**\n"
-            f"• Отслеживаем реакцию цены внутри локального диапазона 1H.\n"
-            f"• Ищем точки входа (FVG / OB + CHoCH на M5) при подходе к локальным границам."
+            f"📍 **РЕЖИМ РАБОТЫ:**\n"
+            f"• Бот настроен на поиск чистых **Sweep + Shift (CHoCH)** без ожидания сложных зон FVG/OB.\n"
+            f"• Сигналы отправляются сразу при сломе структуры на M5 после снятия ликвидности."
         )
 
         telegram(report)
-        log.info("Локальный отчет по золоту отправлен.")
+        log.info("Отчет по золоту отправлен.")
     except Exception as e:
-        log.exception(f"Ошибка локального анализа золота/DXY: {e}")
-
-
-def send_btc_morning_analysis():
-    log.info("🌟 Выполнение анализа по BTC...")
-    btc_info = SYMBOLS.get("BTC / USDT")
-    if not btc_info:
-        return
-
-    ticker = btc_info["ticker"]
-    try:
-        d1 = fetch_bingx_bars(ticker, "1d")
-        h4 = fetch_bingx_bars(ticker, "4h")
-        h1 = fetch_bingx_bars(ticker, "1h")
-        
-        if not d1 or not h4 or not h1:
-            return
-
-        bias = calculate_daily_bias(d1, h4)
-        qt_phase = get_quarterly_phase()
-        rd = calculate_range_dynamics(h1, window=24)
-        dol = calculate_dol_levels(d1)
-        obs = find_order_blocks(h4)
-        current_btc_price = h1[-1]["close"] if h1 else 0.0
-
-        report = (
-            f"🟠 **ЛОКАЛЬНЫЙ АНАЛИЗ BITCOIN (BTC/USDT)** 🟠\n\n"
-            f"💵 **Текущая цена:** `{current_btc_price:.2f}`\n"
-            f"📅 **Daily Bias:** `{bias}`\n"
-            f"⌛ **QT Phase:** `{qt_phase}`\n\n"
-        )
-
-        if rd:
-            report += (
-                f"📊 **Локальный Dealing Range (1H):**\n"
-                f"• Local High (Premium): `{rd['range_high']:.2f}`\n"
-                f"• Local Low (Discount): `{rd['range_low']:.2f}`\n"
-                f"• Equilibrium (EQ): `{rd['eq_level']:.2f}`\n\n"
-            )
-
-        telegram(report)
-        log.info("Локальный отчет по BTC отправлен.")
-    except Exception as e:
-        log.exception(f"Ошибка анализа BTC: {e}")
+        log.exception(f"Ошибка анализа золота: {e}")
 
 
 def cleanup_expired_pending(current_time):
@@ -278,7 +220,7 @@ def cleanup_expired_pending(current_time):
 
 
 def scan_once():
-    log.info("--- Starting scan cycle ---")
+    log.info("--- Starting scan cycle (Pure Price Action Mode) ---")
     current_time = time.time()
     current_prices = {}
     cleanup_expired_pending(current_time)
@@ -291,30 +233,7 @@ def scan_once():
             source = info["source"]
             ticker = info["ticker"]
 
-            if display_symbol in pending_setups:
-                m5 = fetch_bingx_bars(ticker, "5m") if source == "bingx" else fetch_yfinance_bars(ticker, "5m")
-                h1 = fetch_bingx_bars(ticker, "1h") if source == "bingx" else fetch_yfinance_bars(ticker, "1h")
-                if m5 and h1:
-                    last_m5_close = m5[-1]["close"]
-                    current_prices[display_symbol] = {"high": m5[-1]["high"], "low": m5[-1]["low"], "close": last_m5_close}
-                    setup = pending_setups[display_symbol]
-                    
-                    confirmed = (setup["direction"] == "LONG" and last_m5_close > setup["entry"]) or \
-                                (setup["direction"] == "SHORT" and last_m5_close < setup["entry"])
-
-                    if confirmed:
-                        opt_sl, opt_t1, opt_t2, opt_rr = optimize_sl_tp_on_confirmation(
-                            setup["direction"], last_m5_close, m5, h1, symbol=display_symbol
-                        )
-                        if opt_sl:
-                            setup.update({"stop_loss": opt_sl, "target_1": opt_t1, "target_2": opt_t2, "rr_ratio": opt_rr})
-                            telegram(format_confirmed_signal(display_symbol, setup, last_m5_close))
-                            save_signal(display_symbol, setup['tf'], setup['direction'], last_m5_close, opt_sl, opt_t2, opt_rr)
-                            del pending_setups[display_symbol]
-                            symbol_cooldown[display_symbol] = current_time
-                            continue
-
-            if current_time - symbol_cooldown.get(display_symbol, 0) < COOLDOWN_SECONDS or display_symbol in pending_setups:
+            if current_time - symbol_cooldown.get(display_symbol, 0) < COOLDOWN_SECONDS:
                 continue
 
             d1 = fetch_bingx_bars(ticker, "1d") if source == "bingx" else fetch_yfinance_bars(ticker, "1d")
@@ -322,25 +241,51 @@ def scan_once():
             h4 = fetch_bingx_bars(ticker, "4h") if source == "bingx" else fetch_yfinance_bars(ticker, "4h")
             time.sleep(0.15)
             h1 = fetch_bingx_bars(ticker, "1h") if source == "bingx" else fetch_yfinance_bars(ticker, "1h")
+            time.sleep(0.15)
+            m5 = fetch_bingx_bars(ticker, "5m") if source == "bingx" else fetch_yfinance_bars(ticker, "5m")
 
             current_market_price = h1[-1]["close"] if h1 else None
             if h1:
                 current_prices[display_symbol] = {"high": h1[-1]["high"], "low": h1[-1]["low"], "close": current_market_price}
 
+            # Детектим свип ликвидности + структура
             event = detect_sweep(d1, h4, h1, display_symbol, current_price=current_market_price)
             if not event:
-                time.sleep(0.15)
                 continue
 
             key = f"{display_symbol}:{event['tf']}:{event['direction']}:{event['level']:.8f}:{event['bar_time']}"
             if key in last_alerts:
-                time.sleep(0.15)
                 continue
 
             last_alerts.add(key)
-            telegram(format_signal(display_symbol, event))
-            event["created_at"] = current_time
-            pending_setups[display_symbol] = event
+            
+            # Упрощенный расчет стопа и целей прямо по свечам M5 (без жестких FVG)
+            direction = event["direction"]
+            entry_price = current_market_price
+            
+            if direction == "SHORT":
+                # Стоп за локальный хай последних свечей M5 (экстремум закола)
+                stop_loss = max(b["high"] for b in m5[-10:]) + 0.5
+                target = entry_price - (stop_loss - entry_price) * 2  # RR 1:2
+            else:
+                # Стоп за локальный лоу последних свечей M5
+                stop_loss = min(b["low"] for b in m5[-10:]) - 0.5
+                target = entry_price + (entry_price - stop_loss) * 2  # RR 1:2
+
+            signal_msg = (
+                f"🚨 **PRICE ACTION SIGNAL: {display_symbol}** 🚨\n\n"
+                f"📈 Направление: `{direction}`\n"
+                f"🎯 Триггер: Снятие ликвидности + Слом структуры (Shift)\n"
+                f"💵 Цена входа: `{entry_price:.2f}`\n"
+                f"🛡 Стоп-Лосс (SL): `{stop_loss:.2f}`\n"
+                f"🎯 Тейк-Профит (TP): `{target:.2f}`\n"
+                f"⏱ Время: {datetime.now(timezone(timedelta(hours=3))).strftime('%H:%M:%S')}"
+            )
+
+            telegram(signal_msg)
+            save_signal(display_symbol, event['tf'], direction, entry_price, stop_loss, target, 2.0)
+            symbol_cooldown[display_symbol] = current_time
+
             time.sleep(0.2)
         except Exception as exc:
             log.warning("%s: scan failed: %s", display_symbol, exc)
@@ -359,7 +304,6 @@ def main():
     
     send_gold_morning_analysis()
     time.sleep(2)
-    send_btc_morning_analysis()
     
     while True:
         scan_once()
