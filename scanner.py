@@ -145,12 +145,30 @@ def _select_htf_target(direction, entry, h1_bars, h4_bars, d1_bars, fallback_ran
     return min(candidates, key=lambda c: abs(c["price"] - entry))
 
 
-def check_htf_liquidity_magnet(direction, entry, target, stop_loss):
-    """Reject setups where the nearest HTF target leaves less than 1R reward."""
+def classify_bias_alignment(direction, bias):
+    """Label trend alignment; never rejects a setup by itself."""
+    if bias not in ("BULLISH", "BEARISH"):
+        return "NEUTRAL BIAS"
+    trend_direction = "LONG" if bias == "BULLISH" else "SHORT"
+    return "TREND-FOLLOWING" if direction == trend_direction else "COUNTERTREND"
+
+
+def target_is_in_direction(direction, entry, target):
+    """A DOL target must be beyond entry in the intended trade direction."""
+    if not target:
+        return False
+    return target["price"] > entry if direction == "LONG" else target["price"] < entry
+
+
+def check_htf_liquidity_magnet(direction, entry, target, stop_loss, min_rr=1.0):
+    """Require a valid HTF liquidity target and minimum reward/risk."""
     risk = abs(entry - stop_loss)
-    reward = abs(target["price"] - entry) if target else 0
-    if risk <= 0 or reward < risk:
-        log.info("HTF DOL filter: rejected, target reward is below 1R")
+    if risk <= 0 or not target_is_in_direction(direction, entry, target):
+        log.info("HTF DOL filter: rejected, target is missing or not in trade direction")
+        return False
+    reward = abs(target["price"] - entry)
+    if reward / risk < min_rr:
+        log.info("HTF DOL filter: rejected, target reward is below %.2fR", min_rr)
         return False
     return True
 
@@ -177,14 +195,21 @@ def detect_macro_range_sweep(h4_bars, h1_bars, symbol="UNKNOWN", current_price=N
     if risk <= 0 or (direction == "LONG" and stop >= entry) or (direction == "SHORT" and stop <= entry):
         return None
 
+    # Select a reachable H1/H4/D1 liquidity magnet in the sweep direction.
+    # A countertrend setup is allowed only when the post-sweep M15 CHoCH confirms
+    # that same direction; _find_m15_choch() enforces this direction-specific break.
     target = _select_htf_target(direction, entry, h1_bars, h4_bars, d1_bars, sweep)
     if not target or not check_htf_liquidity_magnet(direction, entry, target, stop):
         return None
     reward = abs(target["price"] - entry)
     rr = reward / risk
     bias = calculate_daily_bias(d1_bars, h4_bars)
+    alignment = classify_bias_alignment(direction, bias)
     return {
         "setup_type": "H1_SWEEP_M15_CHOCH", "direction": direction,
+        "bias_alignment": alignment,
+        "countertrend_confirmed": alignment == "COUNTERTREND",
+        "dol_direction": direction,
         "tf": "H1 Sweep / M15 CHoCH", "level": sweep["level"],
         "sweep_extreme": sweep["sweep_extreme"], "sweep_time": sweep["sweep_time"],
         "choch_level": confirmation["choch_level"], "bar_time": confirmation["bar_time"],
@@ -208,7 +233,9 @@ def format_signal(symbol, event):
         f"🪙 **Инструмент:** `{symbol}`\n"
         f"📊 **Направление:** `{event['direction']}`\n"
         f"🧭 **HTF Bias:** `{event['daily_bias']}`\n"
-        f"🎯 **HTF DOL / TP:** `{event['target_source']}`\n\n"
+        f"🧩 **Setup Alignment:** `{event.get('bias_alignment', 'UNCLASSIFIED')}`\n"
+        f"🎯 **HTF DOL / TP:** `{event['target_source']}`\n"
+        f"🧭 **DOL Direction:** `{event.get('dol_direction', event['direction'])}`\n\n"
         f"🕐 **Sweep:** H1 | Уровень: `{event['level']:.5f}`\n"
         f"🪝 **Экстремум закола:** `{event['sweep_extreme']:.5f}`\n"
         f"🔁 **CHoCH:** M15 close за `{event['choch_level']:.5f}`\n"
