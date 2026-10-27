@@ -18,32 +18,36 @@ log = logging.getLogger("main")
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-
 KYIV_TZ = ZoneInfo("Europe/Kyiv")
 
-# Очищенный список активов
-SYMBOLS = [
-    "BTC-USD", "ETH-USD", "SOL-USD",
-    "GC=F",      # Золото (Spot/Futures)
-    "CL=F",      # Нефть WTI
-    "EURUSD=X", "GBPUSD=X", "USDJPY=X", "AUDUSD=X",
-    "^GSPC"      # S&P 500 Index
-]
+# Возвращены оригинальные тикеры
+SYMBOLS = {
+    "DXY": {"source": "yfinance", "ticker": "DX-Y.NYB"},
+    "BTC / USDT": {"source": "bingx", "ticker": "BTC-USDT"},
+    "ETH / USDT": {"source": "bingx", "ticker": "ETH-USDT"},
+    "SOL / USDT": {"source": "bingx", "ticker": "SOL-USDT"},
+    "XAU / USD": {"source": "yfinance", "ticker": "XAUT-USD"},
+    "XAG / USD": {"source": "yfinance", "ticker": "SI=F"},
+    "USOIL / USD": {"source": "yfinance", "ticker": "CL=F"},
+    "US500 / USD": {"source": "yfinance", "ticker": "SPY"},
+    "EUR / USD": {"source": "yfinance", "ticker": "EURUSD=X"},
+    "GBP / USD": {"source": "yfinance", "ticker": "GBPUSD=X"},
+    "USD / JPY": {"source": "yfinance", "ticker": "USDJPY=X"},
+}
 
 LAST_ALERTS = {}
-COOLDOWN_SECONDS = 3600  # 1 час между повторяющимися сигналами по одному символу
+COOLDOWN_SECONDS = 3600
 
 
 def send_telegram_msg(text):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        log.warning("Telegram credentials not found. Message skipped.")
         return
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "Markdown"}
     try:
         requests.post(url, json=payload, timeout=10)
     except Exception as e:
-        log.error(f"Error sending Telegram message: {e}")
+        log.error(f"Telegram error: {e}")
 
 
 def fetch_bingx_bars(symbol, interval="1h", limit=100):
@@ -52,19 +56,16 @@ def fetch_bingx_bars(symbol, interval="1h", limit=100):
         url = f"https://open-api.bingx.com/openApi/swap/v2/quote/klines?symbol={pair}&interval={interval}&limit={limit}"
         res = requests.get(url, timeout=10).json()
         if res.get("code") == 0 and "data" in res:
-            bars = []
-            for item in res["data"]:
-                bars.append({
-                    "timestamp": int(item["time"]) // 1000,
-                    "open": float(item["open"]),
-                    "high": float(item["high"]),
-                    "low": float(item["low"]),
-                    "close": float(item["close"]),
-                    "volume": float(item["volume"])
-                })
-            return bars
+            return [{
+                "timestamp": int(item["time"]) // 1000,
+                "open": float(item["open"]),
+                "high": float(item["high"]),
+                "low": float(item["low"]),
+                "close": float(item["close"]),
+                "volume": float(item["volume"])
+            } for item in res["data"]]
     except Exception as e:
-        log.error(f"BingX fetch error ({symbol}): {e}")
+        log.error(f"BingX error ({symbol}): {e}")
     return []
 
 
@@ -73,24 +74,18 @@ def fetch_yfinance_bars(symbol, interval="1h", period="5d"):
         df = yf.download(symbol, period=period, interval=interval, progress=False)
         if df.empty:
             return []
-        
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.get_level_values(0)
-
-        bars = []
-        for idx, row in df.iterrows():
-            ts = int(idx.timestamp())
-            bars.append({
-                "timestamp": ts,
-                "open": float(row["Open"]),
-                "high": float(row["High"]),
-                "low": float(row["Low"]),
-                "close": float(row["Close"]),
-                "volume": float(row["Volume"]) if "Volume" in row else 0.0
-            })
-        return bars
+        return [{
+            "timestamp": int(idx.timestamp()),
+            "open": float(row["Open"]),
+            "high": float(row["High"]),
+            "low": float(row["Low"]),
+            "close": float(row["Close"]),
+            "volume": float(row["Volume"]) if "Volume" in row else 0.0
+        } for idx, row in df.iterrows()]
     except Exception as e:
-        log.error(f"yfinance fetch error ({symbol}): {e}")
+        log.error(f"yfinance error ({symbol}): {e}")
     return []
 
 
@@ -100,11 +95,10 @@ def get_bars(symbol, timeframe):
         return fetch_bingx_bars(symbol, interval=interval_map.get(timeframe, "1h"))
     else:
         period_map = {"5m": "1d", "1h": "5d", "4h": "10d"}
-        interval_map = {"5m": "5m", "1h": "1h", "4h": "1h"}  # H4 собираем из H1
+        interval_map = {"5m": "5m", "1h": "1h", "4h": "1h"}
         raw_bars = fetch_yfinance_bars(symbol, interval=interval_map.get(timeframe, "1h"), period=period_map.get(timeframe, "5d"))
         
         if timeframe == "4h" and raw_bars:
-            # Правильная агрегация H4 свечей
             h4_bars = []
             for i in range(0, len(raw_bars), 4):
                 chunk = raw_bars[i:i+4]
@@ -125,28 +119,22 @@ def get_bars(symbol, timeframe):
 def process_symbol(symbol):
     h1_bars = get_bars(symbol, "1h")
     h4_bars = get_bars(symbol, "4h")
-
     if not h1_bars or not h4_bars:
         return
 
     current_price = h1_bars[-1]["close"]
-    
-    # Сканер рассчитывает сигнал по чистой структуре
     signal = scanner.detect_macro_range_sweep(h4_bars, h1_bars, symbol=symbol, current_price=current_price)
-    
     if not signal:
         return
 
     now_ts = time.time()
-    last_alert = LAST_ALERTS.get(symbol, 0)
-    if now_ts - last_alert < COOLDOWN_SECONDS:
+    if now_ts - LAST_ALERTS.get(symbol, 0) < COOLDOWN_SECONDS:
         return
 
     LAST_ALERTS[symbol] = now_ts
     created_at = datetime.now(timezone.utc)
     created_kyiv_str = created_at.astimezone(KYIV_TZ).strftime("%H:%M:%S")
 
-    # Сохраняем в трекер ровно те же параметры, что отдал сканер
     tracker.save_trade(
         symbol=symbol,
         direction=signal["direction"],
@@ -171,7 +159,7 @@ def process_symbol(symbol):
 
 def main():
     tracker.init_db()
-    log.info("🚀 Liquidity Hunter Bot успешно запущен...")
+    log.info("🚀 Liquidity Hunter Bot запущен с оригинальными тикерами...")
 
     while True:
         try:
@@ -179,11 +167,9 @@ def main():
                 process_symbol(symbol)
                 time.sleep(1)
 
-            # Проверка отработки позиций по актуальным свечам
             tracker.check_open_trades(lambda sym: get_bars(sym, "5m"), send_telegram_msg)
-
         except Exception as e:
-            log.error(f"Ошибка главного цикла: {e}")
+            log.error(f"Main loop error: {e}")
 
         time.sleep(60)
 
