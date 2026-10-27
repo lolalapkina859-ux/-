@@ -95,21 +95,16 @@ def check_htf_liquidity_magnet(direction, current_price, h4_bars):
     if not h4_bars or len(h4_bars) < 50:
         return True  # Слишком длинная история для анализа, пропускаем фильтр
 
-    # Берем старший диапазон 4H (например, за последние 50 баров)
     h4_recent = h4_bars[-50:]
     htf_high = max(b["high"] for b in h4_recent)
     htf_low = min(b["low"] for b in h4_recent)
 
-    # Если мы хотим войти в LONG, но под нами прямо рядом (в пределах 0.3%) находится несобранный минимум 4H,
-    # велика вероятность, что цена идет за ним как за магнитом.
     if direction == "LONG":
         distance_to_low = current_price - htf_low
-        # Если минимум 4H ниже нас совсем близко, это магнит
         if 0 < distance_to_low < (current_price * 0.003):
             log.info(f"🚫 Фильтр 4H Магнита заблокировал LONG: сильный пулл ликвидности снизу на {htf_low:.5f}")
             return False
 
-    # Если мы хотим войти в SHORT, но над нами прямо рядом важный максимум 4H
     elif direction == "SHORT":
         distance_to_high = htf_high - current_price
         if 0 < distance_to_high < (current_price * 0.003):
@@ -125,7 +120,8 @@ def check_htf_liquidity_magnet(direction, current_price, h4_bars):
 
 def detect_macro_range_sweep(h4_bars, h1_bars, symbol="UNKNOWN", current_price=None, d1_bars=None):
     """
-    Упрощенный и чувствительный детектор свипов ликвидности с учетом 4H магнитов.
+    Упрощенный и чувствительный детектор свипов ликвидности с учетом 4H магнитов,
+    адекватных минимальных буферов и привязки тейков к структурным границам.
     """
     if not h4_bars or len(h4_bars) < 20:
         return None
@@ -133,7 +129,6 @@ def detect_macro_range_sweep(h4_bars, h1_bars, symbol="UNKNOWN", current_price=N
     h4_curr = h4_bars[-1]
     active_entry = current_price if current_price is not None and current_price > 0 else h4_curr["close"]
 
-    # Берем динамический диапазон за последние 24 бара (1H) или 4H
     rd = calculate_range_dynamics(h1_bars if h1_bars and len(h1_bars) >= 24 else h4_bars, window=24)
     if not rd:
         return None
@@ -149,7 +144,6 @@ def detect_macro_range_sweep(h4_bars, h1_bars, symbol="UNKNOWN", current_price=N
     direction = None
     level = 0.0
 
-    # Условия закола (Sweep)
     if h4_curr["high"] >= macro_high - (macro_high * 0.0002):
         setup_type = "PRICE_ACTION_SWEEP"
         direction = "SHORT"
@@ -169,8 +163,17 @@ def detect_macro_range_sweep(h4_bars, h1_bars, symbol="UNKNOWN", current_price=N
 
     log.info(f"🚨 [{symbol}] SWEEP ОБНАРУЖЕН! Направление: {direction} по цене {active_entry:.5f}")
 
+    # Задаем надежный минимальный буфер за уровнем ликвидности (избегаем микро-стопов)
+    sym_upper = symbol.upper()
+    if "XAU" in sym_upper or "GOLD" in sym_upper:
+        min_buffer = 3.5  # минимум 3.5 доллара для золота
+    elif "JPY" in sym_upper:
+        min_buffer = 0.20  # минимум для USD/JPY и кроссов с йеной
+    else:
+        min_buffer = level * 0.0008
+
     atr = calculate_atr(h4_bars, period=14)
-    buffer = atr * 0.4 if atr > 0 else level * 0.002
+    buffer = max(atr * 0.5, min_buffer)
 
     if direction == "SHORT":
         stop_loss = level + buffer
@@ -178,16 +181,22 @@ def detect_macro_range_sweep(h4_bars, h1_bars, symbol="UNKNOWN", current_price=N
         if risk <= 0:
             risk = active_entry * 0.005
             stop_loss = active_entry + risk
-        target_1 = active_entry - (risk * 1.5)
-        target_2 = active_entry - (risk * 3.0)
+        
+        # Тейк-профит целим к противоположному магниту (напр. к нижней границе ренджа macro_low) с RR не менее 2.0
+        structural_target = macro_low if macro_low < active_entry else active_entry - (risk * 2.0)
+        target_1 = min(structural_target, active_entry - (risk * 2.0))
+        target_2 = active_entry - (risk * 3.5)
     else:
         stop_loss = level - buffer
         risk = active_entry - stop_loss
         if risk <= 0:
             risk = active_entry * 0.005
             stop_loss = active_entry - risk
-        target_1 = active_entry + (risk * 1.5)
-        target_2 = active_entry + (risk * 3.0)
+        
+        # Тейк-профит целим к верхней границе ренджа macro_high
+        structural_target = macro_high if macro_high > active_entry else active_entry + (risk * 2.0)
+        target_1 = max(structural_target, active_entry + (risk * 2.0))
+        target_2 = active_entry + (risk * 3.5)
 
     return {
         "setup_type": "PRICE_ACTION_SWEEP",
@@ -201,9 +210,9 @@ def detect_macro_range_sweep(h4_bars, h1_bars, symbol="UNKNOWN", current_price=N
         "stop_loss": stop_loss,
         "target_1": target_1,
         "target_2": target_2,
-        "rr_ratio": 2.0,
+        "rr_ratio": round((target_1 - active_entry) / risk if direction == "LONG" else (active_entry - target_1) / risk, 1),
         "bar_time": h4_curr["timestamp"],
-        "confluence": "Liquidity Sweep + Local Structure Break + HTF Magnet Filter",
+        "confluence": "Liquidity Sweep + Local Structure Break + HTF Magnet Filter + Structural TP",
         "fvg_zone": "Price Action Entry"
     }
 
