@@ -1,29 +1,24 @@
-# Liquidity Hunter FX — H1 Sweep / M5 CHoCH / HTF SL-TP
+# Liquidity Hunter FX — corrected starter package
 
-Telegram alert bot deployed as a Railway worker. It does not place orders.
+## Files
+- `main.py`: scan loop, market data adapters, fresh-quote gate, Telegram alerts.
+- `scanner.py`: closed-candle H1 sweep + recent M5 CHoCH, SL buffer, nearest HTF liquidity target and RR.
+- `tracker.py`: SQLite tracking with expired and ambiguous outcomes separated from wins/losses.
 
-## Signal logic
-1. Uses a **closed H1 candle** to detect a true liquidity sweep: price trades beyond the prior 24-candle H1 high/low and closes back inside the level.
-2. Waits for a **closed M5 candle** to break a confirmed local structure pivot in the DOL direction (CHoCH). M5 is only an early-entry confirmation timeframe.
-3. Entry is the close of that M5 confirmation candle.
-4. SL is calculated only from the actual H1 sweep wick extreme plus a small volatility-based buffer; M5 swings never define the stop.
-5. TP is selected from confirmed H1/H4 liquidity (with daily levels as context); M5 swings never define the target.
-6. SL buffer = volatility buffer + configurable per-symbol spread reserve. Spread reserve is added beyond the H1 sweep wick, and RR is recalculated after the adjustment.
-6. The minimum 1R filter remains. HTF bias is contextual: countertrend signals are allowed only after the H1 Sweep and M5 CHoCH confirm the chosen DOL direction.
-
-## Setup / Railway
-Required variables:
+## Required Railway variables
 - `TELEGRAM_BOT_TOKEN`
 - `TELEGRAM_CHAT_ID`
-- Optional: `SCAN_INTERVAL_SECONDS` (defaults to 60)
-
-Install requirements and run `python main.py`, or deploy as a Railway worker using the existing `Procfile`.
+- Optional `SCAN_INTERVAL_SECONDS` (default 60)
+- Optional `SPREAD_BUFFER_XAU_USD`, `SPREAD_BUFFER_EUR_USD`, etc. Values are raw price units.
 
 ## Important limitations
-- Market data still comes from BingX for crypto and Yahoo Finance for other instruments. These feeds do not provide the live FxPro bid/ask spread used by this bot; spread reserves are configurable estimates, not live broker spread measurements. Tune them to your FxPro account and symbol specifications. These quotes may differ from the broker's CFD prices; especially note that `XAUT-USD` is not the same instrument as a broker's `XAUUSD` CFD.
-- Yahoo Finance 4H bars are aggregated from 1H bars and may not align perfectly with broker session boundaries.
-- The HTF bias is intentionally a simple directional filter, not a complete discretionary ICT/SMC model.
-- TP selection is algorithmic: the nearest qualifying pivot/PDH/PDL can be a weak liquidity level. Validate chart-by-chart before using live.
-- Tracker still evaluates outcomes from fetched H1 highs/lows, so if SL and TP are both touched within the same H1 candle, intrabar order cannot be known from these bars. Such outcomes should be reviewed manually.
-- The algorithm is not backtested or guaranteed profitable. Start with alerts only and verify signals against the exact broker chart.
-- Never commit `.env` or API tokens to GitHub.
+1. This package does **not** connect to FxPro cTrader. Yahoo/BingX prices are indicative and may differ from the broker's Bid/Ask. For live trading decisions, add cTrader Open API and use its exact symbol candles and Bid/Ask quote.
+2. Yahoo `XAUUSD=X`/`XAGUSD=X` availability depends on Yahoo's feed. `US500 / USD` remains a SPY proxy and `USOIL / USD` remains a futures proxy; do not treat these as exact broker symbols.
+3. The tracker checks candle High/Low touches, not actual fills. If SL and TP are both within one candle, it marks the result `AMBIGUOUS` rather than guessing which came first.
+4. Signals are alerts only. The bot does not execute trades.
+5. Before deploying, test in a separate Railway service or branch and inspect logs. Keep your current deployment as a rollback copy.
+
+## Python dependencies
+`requests`, `python-dotenv`, `yfinance`, `pandas`
+
+Run: `python main.py`
