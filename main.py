@@ -34,6 +34,29 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 SCAN_SECONDS = int(os.getenv("SCAN_INTERVAL_SECONDS", "60"))
 
+# Spread reserves are in raw price units (not pips). These are conservative defaults,
+# not live FxPro spreads; set SPREAD_BUFFER_<KEY> in Railway variables to tune them.
+SPREAD_BUFFER_DEFAULTS = {
+    "BTC_USDT": 10.0, "ETH_USDT": 1.0, "SOL_USDT": 0.10,
+    "XAU_USD": 0.50, "XAG_USD": 0.03, "USOIL_USD": 0.05,
+    "US500_USD": 0.50, "EUR_USD": 0.00015, "GBP_USD": 0.00015,
+    "USD_JPY": 0.015,
+}
+
+def get_spread_buffer(display_symbol):
+    key = display_symbol.replace(" / ", "_").replace(" ", "_").upper()
+    raw = os.getenv(f"SPREAD_BUFFER_{key}")
+    if raw is None:
+        return SPREAD_BUFFER_DEFAULTS.get(key, 0.0)
+    try:
+        value = float(raw)
+        if value < 0:
+            raise ValueError("spread buffer must be non-negative")
+        return value
+    except ValueError as exc:
+        raise ValueError(f"Invalid SPREAD_BUFFER_{key}: {raw!r}; expected non-negative price value") from exc
+
+
 SYMBOLS = {
     "DXY": {"source": "yfinance", "ticker": "DX-Y.NYB"},
     "BTC / USDT": {"source": "bingx", "ticker": "BTC-USDT"},
@@ -308,7 +331,8 @@ def scan_once():
             event = detect_sweep(
                 d1, h4, h1, display_symbol,
                 current_price=(h1[-1]["close"] if h1 else None),
-                m5_bars=m5
+                m5_bars=m5,
+                spread_buffer=get_spread_buffer(display_symbol)
             )
             if not event:
                 continue

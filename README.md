@@ -1,14 +1,15 @@
-# Liquidity Hunter FX — H1 Sweep / M15 CHoCH
+# Liquidity Hunter FX — H1 Sweep / M5 CHoCH / HTF SL-TP
 
 Telegram alert bot deployed as a Railway worker. It does not place orders.
 
 ## Signal logic
 1. Uses a **closed H1 candle** to detect a true liquidity sweep: price trades beyond the prior 24-candle H1 high/low and closes back inside the level.
-2. Waits for a **closed M15 candle** to break a confirmed local structure pivot in the reversal direction (CHoCH).
-3. Entry is the close of that M15 confirmation candle.
-4. SL is beyond the actual H1 sweep wick with a small volatility-based safety buffer.
-5. TP is the nearest eligible liquidity level in the trade direction, selected from confirmed H1/H4 swing pivots, previous daily high/low, or the sweep range boundary.
-6. HTF filter rejects setups where the selected target offers less than 1R and reports the simplified H4 bias as context; reversal setups are not automatically rejected solely because they counter that bias.
+2. Waits for a **closed M5 candle** to break a confirmed local structure pivot in the DOL direction (CHoCH). M5 is only an early-entry confirmation timeframe.
+3. Entry is the close of that M5 confirmation candle.
+4. SL is calculated only from the actual H1 sweep wick extreme plus a small volatility-based buffer; M5 swings never define the stop.
+5. TP is selected from confirmed H1/H4 liquidity (with daily levels as context); M5 swings never define the target.
+6. SL buffer = volatility buffer + configurable per-symbol spread reserve. Spread reserve is added beyond the H1 sweep wick, and RR is recalculated after the adjustment.
+6. The minimum 1R filter remains. HTF bias is contextual: countertrend signals are allowed only after the H1 Sweep and M5 CHoCH confirm the chosen DOL direction.
 
 ## Setup / Railway
 Required variables:
@@ -19,7 +20,7 @@ Required variables:
 Install requirements and run `python main.py`, or deploy as a Railway worker using the existing `Procfile`.
 
 ## Important limitations
-- Market data still comes from BingX for crypto and Yahoo Finance for other instruments. These quotes may differ from the broker's CFD prices; especially note that `XAUT-USD` is not the same instrument as a broker's `XAUUSD` CFD.
+- Market data still comes from BingX for crypto and Yahoo Finance for other instruments. These feeds do not provide the live FxPro bid/ask spread used by this bot; spread reserves are configurable estimates, not live broker spread measurements. Tune them to your FxPro account and symbol specifications. These quotes may differ from the broker's CFD prices; especially note that `XAUT-USD` is not the same instrument as a broker's `XAUUSD` CFD.
 - Yahoo Finance 4H bars are aggregated from 1H bars and may not align perfectly with broker session boundaries.
 - The HTF bias is intentionally a simple directional filter, not a complete discretionary ICT/SMC model.
 - TP selection is algorithmic: the nearest qualifying pivot/PDH/PDL can be a weak liquidity level. Validate chart-by-chart before using live.

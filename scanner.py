@@ -174,7 +174,7 @@ def check_htf_liquidity_magnet(direction, entry, target, stop_loss, min_rr=1.0):
     return True
 
 
-def detect_macro_range_sweep(h4_bars, h1_bars, symbol="UNKNOWN", current_price=None, d1_bars=None, m5_bars=None):
+def detect_macro_range_sweep(h4_bars, h1_bars, symbol="UNKNOWN", current_price=None, d1_bars=None, m5_bars=None, spread_buffer=0.0):
     """H1 liquidity sweep -> post-sweep M5 CHoCH; SL/TP remain HTF-derived."""
     sweep = _find_h1_sweep(h1_bars)
     if not sweep:
@@ -189,8 +189,12 @@ def detect_macro_range_sweep(h4_bars, h1_bars, symbol="UNKNOWN", current_price=N
     h4_closed = _closed(h4_bars or [], 14400)
     d1_closed = _closed(d1_bars or [], 86400)
     atr = calculate_atr(h1_closed[-30:], 14)
-    # Small volatility-based safety buffer beyond the actual wick extreme; never substitute another timeframe's extrema.
-    buffer = max(atr * 0.05, abs(entry) * 0.00005)
+    # Add a volatility reserve and a configured spread reserve beyond the H1 wick.
+    # The current data providers do not expose live broker bid/ask quotes, so spread_buffer
+    # is an explicit per-symbol estimate supplied by main.py, not a live spread reading.
+    volatility_buffer = max(atr * 0.05, abs(entry) * 0.00005)
+    spread_buffer = max(0.0, float(spread_buffer or 0.0))
+    buffer = volatility_buffer + spread_buffer
     stop = sweep["sweep_extreme"] + buffer if direction == "SHORT" else sweep["sweep_extreme"] - buffer
     risk = abs(entry - stop)
     if risk <= 0 or (direction == "LONG" and stop >= entry) or (direction == "SHORT" and stop <= entry):
@@ -217,14 +221,15 @@ def detect_macro_range_sweep(h4_bars, h1_bars, symbol="UNKNOWN", current_price=N
         "eq_level": (sweep["range_high"] + sweep["range_low"]) / 2,
         "daily_bias": bias, "qt_phase": get_quarterly_phase(), "entry": entry,
         "stop_loss": stop, "target_1": target["price"], "target_2": target["price"],
+        "volatility_buffer": volatility_buffer, "spread_buffer": spread_buffer,
         "target_source": target["source"], "rr_ratio": round(rr, 2),
         "confluence": "H1 liquidity sweep + M5 close-confirmed CHoCH + HTF DOL target; SL/TP from HTF levels",
         "fvg_zone": "Not required"
     }
 
 
-def detect_sweep(d1_bars, h4_bars, h1_bars, symbol="UNKNOWN", current_price=None, m5_bars=None):
-    return detect_macro_range_sweep(h4_bars, h1_bars, symbol, current_price, d1_bars, m5_bars)
+def detect_sweep(d1_bars, h4_bars, h1_bars, symbol="UNKNOWN", current_price=None, m5_bars=None, spread_buffer=0.0):
+    return detect_macro_range_sweep(h4_bars, h1_bars, symbol, current_price, d1_bars, m5_bars, spread_buffer)
 
 
 def format_signal(symbol, event):
@@ -242,6 +247,7 @@ def format_signal(symbol, event):
         f"🔁 **CHoCH:** M5 close за `{event['choch_level']:.5f}`\n"
         f"💵 **Ранний вход по закрытию M5:** `{event['entry']:.5f}`\n\n"
         f"🛑 **SL за экстремумом:** `{event['stop_loss']:.5f}`\n"
+        f"↔️ **Резерв спреда:** `{event.get('spread_buffer', 0.0):.5f}` (добавлен к буферу волатильности)\n"
         f"🎯 **TP — ближайшая ликвидность:** `{event['target_1']:.5f}`\n"
         f"📐 **Потенциальный RR:** `{event['rr_ratio']:.2f}R`\n"
     )
