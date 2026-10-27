@@ -41,11 +41,12 @@ def check_open_trades(current_prices, telegram_callback):
     """
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
-    cursor.execute("SELECT id, symbol, tf, direction, stop_loss, target, rr_ratio FROM trades WHERE status = 'OPEN'")
+    # Добавили выборку entry_price и created_at для точной идентификации сетапа
+    cursor.execute("SELECT id, symbol, tf, direction, entry_price, stop_loss, target, rr_ratio, created_at FROM trades WHERE status = 'OPEN'")
     open_trades = cursor.fetchall()
 
     for trade in open_trades:
-        trade_id, symbol, tf, direction, sl, tp, rr = trade
+        trade_id, symbol, tf, direction, entry_price, sl, tp, rr, created_at = trade
         if symbol not in current_prices:
             continue
 
@@ -70,15 +71,29 @@ def check_open_trades(current_prices, telegram_callback):
             cursor.execute("UPDATE trades SET status = ? WHERE id = ?", (status_update, trade_id))
             conn.commit()
             
-            # Отправляем уведомление об отработке в Telegram
+            # Красиво форматируем время создания сетапа
+            time_str = ""
+            if created_at:
+                try:
+                    if isinstance(created_at, str):
+                        dt_obj = datetime.fromisoformat(created_at)
+                    else:
+                        dt_obj = created_at
+                    time_str = dt_obj.astimezone(timezone(timedelta(hours=3))).strftime('%H:%M:%S') if 'timezone' in globals() else dt_obj.strftime('%H:%M:%S')
+                except Exception:
+                    time_str = str(created_at)[:19]
+
             icon = "🟢 TARGET HIT! ✅" if status_update == "WIN" else "🔴 STOP LOSS HIT ❌"
             profit_str = f"+{rr}R" if status_update == "WIN" else "-1.0R"
             
+            # Детализированное сообщение с указанием конкретной цены входа
             msg = (
                 f"📊 **ОТРАБОТКА СЕТАПА** [{symbol}]\n"
-                f"Таймфрейм: {tf} | {direction}\n"
+                f"📈 Направление: `{direction}` | TF: `{tf}`\n"
+                f"💵 Цена входа: `{entry_price:.5f}`\n"
+                f"⏱ Время сигнала: `{time_str}`\n"
                 f"Результат: {icon}\n"
-                f"Профит: {profit_str}"
+                f"Профит: `{profit_str}`"
             )
             telegram_callback(msg)
 
