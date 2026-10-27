@@ -86,16 +86,37 @@ def calculate_daily_bias(d1_bars, h4_bars):
     return "BULLISH"
 
 
-def find_nearest_local_target(direction, entry_price, bars_list):
-    """Находит ближайший локальный экстремум для целей T1."""
-    if not bars_list:
-        return None
+def check_htf_liquidity_magnet(direction, current_price, h4_bars):
+    """
+    ФИЛЬТР СТАРШЕГО МАГНИТА (HTF DOL):
+    Проверяет, не идет ли сделка прямо навстречу ближайшему крупному пулу ликвидности 4H.
+    Если до магнита ликвидности очень близко и цена движется к нему, возвращает False (фильтруем сигнал).
+    """
+    if not h4_bars or len(h4_bars) < 50:
+        return True  длинная история для анализа, пропускаем фильтр
+
+    # Берем старший диапазон 4H (например, за последние 50 баров)
+    h4_recent = h4_bars[-50:]
+    htf_high = max(b["high"] for b in h4_recent)
+    htf_low = min(b["low"] for b in h4_recent)
+
+    # Если мы хотим войти в LONG, но под нами прямо рядом (в пределах 0.3%) находится несобранный минимум 4H,
+    # велика вероятность, что цена идет за ним как за магнитом.
     if direction == "LONG":
-        highs = [b["high"] for b in bars_list if b["high"] > entry_price]
-        return min(highs) if highs else entry_price * 1.01
-    else:
-        lows = [b["low"] for b in bars_list if b["low"] < entry_price]
-        return max(lows) if lows else entry_price * 0.99
+        distance_to_low = current_price - htf_low
+        # Если минимум 4H ниже нас совсем близко, это магнит
+        if 0 < distance_to_low < (current_price * 0.003):
+            log.info(f"🚫 Фильтр 4H Магнита заблокировал LONG: сильный пулл ликвидности снизу на {htf_low:.5f}")
+            return False
+
+    # Если мы хотим войти в SHORT, но над нами прямо рядом важный максимум 4H
+    elif direction == "SHORT":
+        distance_to_high = htf_high - current_price
+        if 0 < distance_to_high < (current_price * 0.003):
+            log.info(f"🚫 Фильтр 4H Магнита заблокировал SHORT: сильный пулл ликвидности сверху на {htf_high:.5f}")
+            return False
+
+    return True
 
 
 # ==========================================
@@ -104,8 +125,7 @@ def find_nearest_local_target(direction, entry_price, bars_list):
 
 def detect_macro_range_sweep(h4_bars, h1_bars, symbol="UNKNOWN", current_price=None, d1_bars=None):
     """
-    Упрощенный и чувствительный детектор свипов ликвидности.
-    Срабатывает при выходе цены за локальные экстремумы диапазона 1H/4H.
+    Упрощенный и чувствительный детектор свипов ликвидности с учетом 4H магнитов.
     """
     if not h4_bars or len(h4_bars) < 20:
         return None
@@ -129,7 +149,7 @@ def detect_macro_range_sweep(h4_bars, h1_bars, symbol="UNKNOWN", current_price=N
     direction = None
     level = 0.0
 
-    # Условия закола (Sweep): цена проколола границу и закрылась обратно внутрь диапазона
+    # Условия закола (Sweep)
     if h4_curr["high"] >= macro_high - (macro_high * 0.0002):
         setup_type = "PRICE_ACTION_SWEEP"
         direction = "SHORT"
@@ -140,6 +160,11 @@ def detect_macro_range_sweep(h4_bars, h1_bars, symbol="UNKNOWN", current_price=N
         level = macro_low
 
     if not setup_type:
+        return None
+
+    # ПРИМЕНЯЕМ ФИЛЬТР СТАРШЕГО МАГНИТА 4H
+    if not check_htf_liquidity_magnet(direction, active_entry, h4_bars):
+        log.info(f"🛡 [{symbol}] Сигнал {direction} отфильтрован из-за близости 4H магнита ликвидности.")
         return None
 
     log.info(f"🚨 [{symbol}] SWEEP ОБНАРУЖЕН! Направление: {direction} по цене {active_entry:.5f}")
@@ -178,7 +203,7 @@ def detect_macro_range_sweep(h4_bars, h1_bars, symbol="UNKNOWN", current_price=N
         "target_2": target_2,
         "rr_ratio": 2.0,
         "bar_time": h4_curr["timestamp"],
-        "confluence": "Liquidity Sweep + Local Structure Break",
+        "confluence": "Liquidity Sweep + Local Structure Break + HTF Magnet Filter",
         "fvg_zone": "Price Action Entry"
     }
 
