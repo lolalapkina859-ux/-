@@ -28,8 +28,8 @@ SYMBOLS = {
     'ETH / USDT': {'source':'bingx', 'ticker':'ETH-USDT'},
     'SOL / USDT': {'source':'bingx', 'ticker':'SOL-USDT'},
     # Yahoo XAUUSD=X is a spot-gold reference quote, not a guaranteed FxPro quote.
-    'XAU / USD': {'source':'yfinance', 'ticker':'XAUUSD=X'},
-    'XAG / USD': {'source':'yfinance', 'ticker':'XAGUSD=X'},
+    'XAU / USD': {"source": "yfinance", "ticker": "XAUT-USD"},
+    'XAG / USD': {"source": "yfinance", "ticker": "SI=F"},
     'USOIL / USD': {'source':'yfinance', 'ticker':'CL=F'},
     'US500 / USD': {'source':'yfinance', 'ticker':'SPY'},
     'EUR / USD': {'source':'yfinance', 'ticker':'EURUSD=X'},
