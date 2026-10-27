@@ -4,193 +4,220 @@ from datetime import datetime, timezone
 log = logging.getLogger("liquidity-hunter")
 
 
-# ==========================================
-# 1. ТЕХНИЧЕСКИЕ ИНДИКАТОРЫ И ВПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
-# ==========================================
-
 def calculate_atr(bars, period=14):
-    """Расчет Average True Range (ATR)."""
     if not bars or len(bars) < period + 1:
         return 0.0
-    tr_list = []
+    trs = []
     for i in range(1, len(bars)):
-        high = bars[i]["high"]
-        low = bars[i]["low"]
-        prev_close = bars[i - 1]["close"]
-        tr = max(high - low, abs(high - prev_close), abs(low - prev_close))
-        tr_list.append(tr)
-    return sum(tr_list[-period:]) / period if tr_list else 0.0
+        high, low, prev_close = bars[i]["high"], bars[i]["low"], bars[i - 1]["close"]
+        trs.append(max(high - low, abs(high - prev_close), abs(low - prev_close)))
+    return sum(trs[-period:]) / period
 
 
-def calculate_range_dynamics(bars, window=24):
-    """Динамика диапазона (Range High, Range Low, Equilibrium)."""
+def _closed(bars, timeframe_seconds):
+    """Drop the most recent candle because providers commonly include a live candle."""
+    if not bars:
+        return []
+    now = datetime.now(timezone.utc).timestamp()
+    # Timestamps are candle-open timestamps for both supported providers.
+    return [b for b in bars if float(b.get("timestamp", 0)) + timeframe_seconds <= now]
+
+
+def calculate_dol_levels(d1_bars, w1_bars=None):
+    levels = {}
+    d1 = _closed(d1_bars, 86400)
+    w1 = _closed(w1_bars, 604800) if w1_bars else []
+    if d1:
+        levels["PDH"] = d1[-1]["high"]
+        levels["PDL"] = d1[-1]["low"]
+    if w1:
+        levels["PWH"] = w1[-1]["high"]
+        levels["PWL"] = w1[-1]["low"]
+    return levels
+
+
+def calculate_range_dynamics(bars, window=20):
     if not bars or len(bars) < window:
         return None
-
-    recent_bars = bars[-window:]
-    range_high = max(b["high"] for b in recent_bars)
-    range_low = min(b["low"] for b in recent_bars)
-    eq_level = (range_high + range_low) / 2.0
-
-    return {
-        "range_high": range_high,
-        "range_low": range_low,
-        "eq_level": eq_level
-    }
+    recent = bars[-window:]
+    high = max(b["high"] for b in recent)
+    low = min(b["low"] for b in recent)
+    return {"range_high": high, "range_low": low, "eq_level": (high + low) / 2.0}
 
 
-def calculate_daily_bias(h4_bars):
-    """Определение Daily/4H Bias по структуре рынка."""
-    if not h4_bars or len(h4_bars) < 10:
+def get_quarterly_phase(dt=None):
+    if dt is None:
+        dt = datetime.now(timezone.utc)
+    hour = dt.hour
+    if hour < 6:
+        return "Q1 (Accumulation)"
+    if hour < 12:
+        return "Q2 (Manipulation)"
+    if hour < 18:
+        return "Q3 (Distribution)"
+    return "Q4 (Reversal/Continuation)"
+
+
+def calculate_daily_bias(d1_bars, h4_bars):
+    bars = _closed(h4_bars or [], 14400)
+    if len(bars) < 20:
         return "NEUTRAL"
-    if h4_bars[-1]["close"] < h4_bars[-10]["close"]:
-        return "BEARISH"
-    return "BULLISH"
+    recent = bars[-1]["close"]
+    prior = bars[-10]["close"]
+    return "BEARISH" if recent < prior else "BULLISH" if recent > prior else "NEUTRAL"
 
 
-# ==========================================
-# 2. ФИЛЬТР СТАРШЕГО МАГНИТА (HTF DOL)
-# ==========================================
+def _confirmed_pivots(bars, left=2, right=2):
+    highs, lows = [], []
+    for i in range(left, len(bars) - right):
+        hi = bars[i]["high"]
+        lo = bars[i]["low"]
+        if all(hi > bars[j]["high"] for j in range(i-left, i)) and all(hi >= bars[j]["high"] for j in range(i+1, i+right+1)):
+            highs.append({"price": hi, "timestamp": bars[i]["timestamp"], "index": i})
+        if all(lo < bars[j]["low"] for j in range(i-left, i)) and all(lo <= bars[j]["low"] for j in range(i+1, i+right+1)):
+            lows.append({"price": lo, "timestamp": bars[i]["timestamp"], "index": i})
+    return highs, lows
 
-def check_htf_liquidity_magnet(direction, current_price, h4_bars):
-    """
-    Проверяет, не идет ли сделка прямо навстречу крупному несобранному пулу 4H.
-    """
-    if not h4_bars or len(h4_bars) < 40:
-        return True
 
-    h4_recent = h4_bars[-40:]
-    htf_high = max(b["high"] for b in h4_recent)
-    htf_low = min(b["low"] for b in h4_recent)
+def _find_h1_sweep(h1_bars, lookback=24, max_age_bars=3):
+    bars = _closed(h1_bars or [], 3600)
+    if len(bars) < lookback + 3:
+        return None
+    # Search only the latest few closed H1 candles; the reference range excludes the sweep candle.
+    start = max(lookback, len(bars) - max_age_bars)
+    for i in range(len(bars) - 1, start - 1, -1):
+        candle = bars[i]
+        prior = bars[i-lookback:i]
+        prior_high = max(b["high"] for b in prior)
+        prior_low = min(b["low"] for b in prior)
+        if candle["high"] > prior_high and candle["close"] < prior_high:
+            return {"direction": "SHORT", "level": prior_high, "sweep_extreme": candle["high"], "sweep_time": candle["timestamp"], "sweep_close_time": candle["timestamp"] + 3600, "range_high": prior_high, "range_low": prior_low, "sweep_bar": candle}
+        if candle["low"] < prior_low and candle["close"] > prior_low:
+            return {"direction": "LONG", "level": prior_low, "sweep_extreme": candle["low"], "sweep_time": candle["timestamp"], "sweep_close_time": candle["timestamp"] + 3600, "range_high": prior_high, "range_low": prior_low, "sweep_bar": candle}
+    return None
 
-    if direction == "LONG":
-        distance_to_low = current_price - htf_low
-        if 0 < distance_to_low < (current_price * 0.003):
-            log.info(f"🚫 [DOL Filter] LONG отфильтрован: рядом 4H магнит на {htf_low:.5f}")
-            return False
-    elif direction == "SHORT":
-        distance_to_high = htf_high - current_price
-        if 0 < distance_to_high < (current_price * 0.003):
-            log.info(f"🚫 [DOL Filter] SHORT отфильтрован: рядом 4H магнит на {htf_high:.5f}")
-            return False
 
+def _find_m15_choch(m15_bars, sweep, pivot_left=2, pivot_right=2):
+    bars = _closed(m15_bars or [], 900)
+    # Require confirmation candles to close after the H1 sweep candle has closed.
+    post = [(i, b) for i, b in enumerate(bars) if b["timestamp"] >= sweep["sweep_close_time"]]
+    if len(post) < 5:
+        return None
+    highs, lows = _confirmed_pivots(bars, pivot_left, pivot_right)
+    direction = sweep["direction"]
+    for original_i, candle in post:
+        prior_pivots = [p for p in (lows if direction == "SHORT" else highs) if p["index"] + pivot_right < original_i and p["timestamp"] >= sweep["sweep_close_time"] - 6 * 3600]
+        if not prior_pivots:
+            continue
+        pivot = prior_pivots[-1]
+        if direction == "SHORT" and candle["close"] < pivot["price"]:
+            return {"bar": candle, "bar_time": candle["timestamp"], "entry": candle["close"], "choch_level": pivot["price"]}
+        if direction == "LONG" and candle["close"] > pivot["price"]:
+            return {"bar": candle, "bar_time": candle["timestamp"], "entry": candle["close"], "choch_level": pivot["price"]}
+    return None
+
+
+def _select_htf_target(direction, entry, h1_bars, h4_bars, d1_bars, fallback_range):
+    candidates = []
+    h1 = _closed(h1_bars or [], 3600)
+    h4 = _closed(h4_bars or [], 14400)
+    d1 = _closed(d1_bars or [], 86400)
+    for tf, bars in (("H1", h1[-120:]), ("H4", h4[-60:])):
+        ph, pl = _confirmed_pivots(bars, 2, 2)
+        pivots = ph if direction == "LONG" else pl
+        for p in pivots:
+            price = p["price"]
+            if (direction == "LONG" and price > entry) or (direction == "SHORT" and price < entry):
+                candidates.append({"price": price, "source": f"{tf} swing liquidity", "timestamp": p["timestamp"]})
+    if len(d1) >= 2:
+        # Previous fully closed daily candle is the second-last item if the current daily candle is present.
+        prev_day = d1[-1]
+        daily_level = prev_day["high"] if direction == "LONG" else prev_day["low"]
+        if (direction == "LONG" and daily_level > entry) or (direction == "SHORT" and daily_level < entry):
+            candidates.append({"price": daily_level, "source": "PDH" if direction == "LONG" else "PDL", "timestamp": prev_day["timestamp"]})
+    if fallback_range:
+        price = fallback_range["range_high"] if direction == "LONG" else fallback_range["range_low"]
+        if (direction == "LONG" and price > entry) or (direction == "SHORT" and price < entry):
+            candidates.append({"price": price, "source": "H1 range boundary", "timestamp": 0})
+    if not candidates:
+        return None
+    # Nearest valid liquidity pool in the trade direction.
+    return min(candidates, key=lambda c: abs(c["price"] - entry))
+
+
+def check_htf_liquidity_magnet(direction, entry, target, stop_loss):
+    """Reject setups where the nearest HTF target leaves less than 1R reward."""
+    risk = abs(entry - stop_loss)
+    reward = abs(target["price"] - entry) if target else 0
+    if risk <= 0 or reward < risk:
+        log.info("HTF DOL filter: rejected, target reward is below 1R")
+        return False
     return True
 
 
-# ==========================================
-# 3. ДЕТЕКЦИЯ SWEEP + SHIFT & СТРУКТУРНЫЙ РАСЧЕТ SL/TP
-# ==========================================
-
-def detect_macro_range_sweep(h4_bars, h1_bars, m5_bars=None, symbol="UNKNOWN", current_price=None):
-    """
-    Чистый Price Action: Детекция снятия ликвидности (Sweep) с безопасным SL за экстремум
-    и таргетом на противоположную границу (DOL).
-    """
-    if not h4_bars or len(h4_bars) < 20 or not h1_bars or len(h1_bars) < 24:
+def detect_macro_range_sweep(h4_bars, h1_bars, symbol="UNKNOWN", current_price=None, d1_bars=None, m15_bars=None):
+    """H1 liquidity sweep -> post-sweep M15 CHoCH -> entry at closed confirmation candle."""
+    sweep = _find_h1_sweep(h1_bars)
+    if not sweep:
+        return None
+    confirmation = _find_m15_choch(m15_bars or [], sweep)
+    if not confirmation:
         return None
 
-    active_entry = current_price if current_price is not None and current_price > 0 else h1_bars[-1]["close"]
-    
-    # Исключаем текущую открытую свечу из определения границ диапазона
-    past_h1_bars = h1_bars[:-1] if len(h1_bars) > 24 else h1_bars
-    rd = calculate_range_dynamics(past_h1_bars, window=24)
-    if not rd:
+    direction = sweep["direction"]
+    entry = confirmation["entry"]
+    h1_closed = _closed(h1_bars or [], 3600)
+    h4_closed = _closed(h4_bars or [], 14400)
+    d1_closed = _closed(d1_bars or [], 86400)
+    atr = calculate_atr(h1_closed[-30:], 14)
+    # Small volatility-based safety buffer beyond the actual wick extreme; never substitute another timeframe's extrema.
+    buffer = max(atr * 0.05, abs(entry) * 0.00005)
+    stop = sweep["sweep_extreme"] + buffer if direction == "SHORT" else sweep["sweep_extreme"] - buffer
+    risk = abs(entry - stop)
+    if risk <= 0 or (direction == "LONG" and stop >= entry) or (direction == "SHORT" and stop <= entry):
         return None
 
-    macro_high = rd["range_high"]
-    macro_low = rd["range_low"]
-    eq_level = rd["eq_level"]
-
-    bias = calculate_daily_bias(h4_bars)
-
-    last_h1 = h1_bars[-1]
-    setup_type = None
-    direction = None
-    level = 0.0
-
-    # Проверка закола ликвидности границы ренджа
-    if last_h1["high"] >= macro_high:
-        setup_type = "PRICE_ACTION_SWEEP"
-        direction = "SHORT"
-        level = macro_high
-    elif last_h1["low"] <= macro_low:
-        setup_type = "PRICE_ACTION_SWEEP"
-        direction = "LONG"
-        level = macro_low
-
-    if not setup_type:
+    target = _select_htf_target(direction, entry, h1_bars, h4_bars, d1_bars, sweep)
+    if not target or not check_htf_liquidity_magnet(direction, entry, target, stop):
         return None
-
-    # Проверка старшего магнита
-    if not check_htf_liquidity_magnet(direction, active_entry, h4_bars):
-        return None
-
-    atr = calculate_atr(h4_bars, period=14)
-    
-    # Расчет буфера с защитой от микро-стопов
-    sym_upper = symbol.upper()
-    if "BTC" in sym_upper:
-        min_risk = 150.0
-    elif "ETH" in sym_upper:
-        min_risk = 12.0
-    elif "XAU" in sym_upper or "GC=" in sym_upper:
-        min_risk = 3.0
-    elif "JPY" in sym_upper:
-        min_risk = 0.25
-    else:
-        min_risk = active_entry * 0.0015
-
-    buffer = max(atr * 0.4, min_risk * 0.3)
-
-    if direction == "SHORT":
-        stop_loss = level + buffer
-        risk = stop_loss - active_entry
-        if risk < min_risk:
-            risk = min_risk
-            stop_loss = active_entry + risk
-
-        # Структурный тейк к противоположной границе
-        structural_target = macro_low
-        if structural_target >= active_entry or (active_entry - structural_target) < (risk * 1.5):
-            target_1 = active_entry - (risk * 2.0)
-        else:
-            target_1 = structural_target
-        target_2 = active_entry - (risk * 3.5)
-
-    else:
-        stop_loss = level - buffer
-        risk = active_entry - stop_loss
-        if risk < min_risk:
-            risk = min_risk
-            stop_loss = active_entry - risk
-
-        structural_target = macro_high
-        if structural_target <= active_entry or (structural_target - active_entry) < (risk * 1.5):
-            target_1 = active_entry + (risk * 2.0)
-        else:
-            target_1 = structural_target
-        target_2 = active_entry + (risk * 3.5)
-
-    rr_ratio = abs(target_1 - active_entry) / risk
-
-    log.info(f"🚨 [{symbol}] SWEEP ОБНАРУЖЕН! Направление: {direction} | Entry: {active_entry:.5f} | SL: {stop_loss:.5f} | TP1: {target_1:.5f}")
-
+    reward = abs(target["price"] - entry)
+    rr = reward / risk
+    bias = calculate_daily_bias(d1_bars, h4_bars)
     return {
-        "setup_type": "PRICE_ACTION_SWEEP",
-        "direction": direction,
-        "tf": "1H / 4H Pure Price Action",
-        "level": level,
-        "eq_level": eq_level,
-        "daily_bias": bias,
-        "entry": active_entry,
-        "stop_loss": stop_loss,
-        "target_1": target_1,
-        "target_2": target_2,
-        "rr_ratio": round(rr_ratio, 2),
-        "bar_time": last_h1["timestamp"],
-        "confluence": "Macro Range Liquidity Sweep + Structural SL/TP"
+        "setup_type": "H1_SWEEP_M15_CHOCH", "direction": direction,
+        "tf": "H1 Sweep / M15 CHoCH", "level": sweep["level"],
+        "sweep_extreme": sweep["sweep_extreme"], "sweep_time": sweep["sweep_time"],
+        "choch_level": confirmation["choch_level"], "bar_time": confirmation["bar_time"],
+        "eq_level": (sweep["range_high"] + sweep["range_low"]) / 2,
+        "daily_bias": bias, "qt_phase": get_quarterly_phase(), "entry": entry,
+        "stop_loss": stop, "target_1": target["price"], "target_2": target["price"],
+        "target_source": target["source"], "rr_ratio": round(rr, 2),
+        "confluence": "H1 liquidity sweep + M15 close-confirmed CHoCH + HTF DOL target",
+        "fvg_zone": "Not required"
     }
 
 
-def detect_sweep(d1_bars, h4_bars, h1_bars, symbol="UNKNOWN", current_price=None):
-    return detect_macro_range_sweep(h4_bars, h1_bars, None, symbol, current_price)
+def detect_sweep(d1_bars, h4_bars, h1_bars, symbol="UNKNOWN", current_price=None, m15_bars=None):
+    return detect_macro_range_sweep(h4_bars, h1_bars, symbol, current_price, d1_bars, m15_bars)
+
+
+def format_signal(symbol, event):
+    emoji = "🟢" if event["direction"] == "LONG" else "🔴"
+    return (
+        f"{emoji} **LIQUIDITY HUNTER FX — CONFIRMED SETUP**\n\n"
+        f"🪙 **Инструмент:** `{symbol}`\n"
+        f"📊 **Направление:** `{event['direction']}`\n"
+        f"🧭 **HTF Bias:** `{event['daily_bias']}`\n"
+        f"🎯 **HTF DOL / TP:** `{event['target_source']}`\n\n"
+        f"🕐 **Sweep:** H1 | Уровень: `{event['level']:.5f}`\n"
+        f"🪝 **Экстремум закола:** `{event['sweep_extreme']:.5f}`\n"
+        f"🔁 **CHoCH:** M15 close за `{event['choch_level']:.5f}`\n"
+        f"💵 **Вход по закрытию M15:** `{event['entry']:.5f}`\n\n"
+        f"🛑 **SL за экстремумом:** `{event['stop_loss']:.5f}`\n"
+        f"🎯 **TP — ближайшая ликвидность:** `{event['target_1']:.5f}`\n"
+        f"📐 **Потенциальный RR:** `{event['rr_ratio']:.2f}R`\n"
+    )
+
+
+def format_confirmed_signal(symbol, event, current_price=None):
+    return format_signal(symbol, event)
