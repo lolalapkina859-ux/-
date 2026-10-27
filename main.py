@@ -211,7 +211,7 @@ def send_gold_morning_analysis():
         report += (
             f"📍 **РЕЖИМ РАБОТЫ:**\n"
             f"• Бот настроен на поиск чистых **Sweep + Shift (CHoCH)** без ожидания сложных зон FVG/OB.\n"
-            f"• Сигнал требует H1 Sweep и подтверждённый M15 CHoCH в сторону выбранной цели HTF DOL."
+            f"• Сигнал требует H1 Sweep и подтверждённый M5 CHoCH в сторону выбранной цели HTF DOL; SL/TP рассчитываются по HTF-уровням."
         )
 
         telegram(report)
@@ -272,7 +272,7 @@ def cleanup_expired_pending(current_time):
 
 
 def scan_once():
-    log.info("--- Starting scan cycle (H1 Sweep / M15 CHoCH / HTF DOL) ---")
+    log.info("--- Starting scan cycle (H1 Sweep / M5 CHoCH / HTF DOL SL/TP) ---")
     current_time = time.time()
     current_prices = {}
     cleanup_expired_pending(current_time)
@@ -291,7 +291,7 @@ def scan_once():
             time.sleep(0.12)
             h1 = fetch(ticker, "1h")
             time.sleep(0.12)
-            m15 = fetch(ticker, "15m")
+            m5 = fetch(ticker, "5m")
             time.sleep(0.12)
 
             if h1:
@@ -308,7 +308,7 @@ def scan_once():
             event = detect_sweep(
                 d1, h4, h1, display_symbol,
                 current_price=(h1[-1]["close"] if h1 else None),
-                m15_bars=m15
+                m5_bars=m5
             )
             if not event:
                 continue
@@ -317,7 +317,7 @@ def scan_once():
             if key in last_alerts:
                 continue
 
-            # Entry, SL and TP are calculated by scanner from the confirmed M15 close,
+            # Entry, SL and TP are calculated by scanner from the confirmed M5 close,
             # actual H1 sweep wick and nearest eligible H1/H4/D1 liquidity target.
             signal_msg = format_signal(display_symbol, event)
             telegram(signal_msg)
@@ -329,7 +329,7 @@ def scan_once():
             last_alerts.add(key)
             symbol_cooldown[display_symbol] = current_time
             log.info(
-                "[%s] %s confirmed: entry=%.8f SL=%.8f TP=%.8f RR=%.2f",
+                "[%s] %s confirmed (M5 CHoCH / HTF SL-TP): entry=%.8f SL=%.8f TP=%.8f RR=%.2f",
                 display_symbol, event["direction"], event["entry"],
                 event["stop_loss"], event["target_1"], event["rr_ratio"]
             )

@@ -97,8 +97,9 @@ def _find_h1_sweep(h1_bars, lookback=24, max_age_bars=3):
     return None
 
 
-def _find_m15_choch(m15_bars, sweep, pivot_left=2, pivot_right=2):
-    bars = _closed(m15_bars or [], 900)
+def _find_m5_choch(m5_bars, sweep, pivot_left=2, pivot_right=2):
+    """Use M5 only for early structure confirmation; never for SL/TP calculation."""
+    bars = _closed(m5_bars or [], 300)
     # Require confirmation candles to close after the H1 sweep candle has closed.
     post = [(i, b) for i, b in enumerate(bars) if b["timestamp"] >= sweep["sweep_close_time"]]
     if len(post) < 5:
@@ -173,12 +174,12 @@ def check_htf_liquidity_magnet(direction, entry, target, stop_loss, min_rr=1.0):
     return True
 
 
-def detect_macro_range_sweep(h4_bars, h1_bars, symbol="UNKNOWN", current_price=None, d1_bars=None, m15_bars=None):
-    """H1 liquidity sweep -> post-sweep M15 CHoCH -> entry at closed confirmation candle."""
+def detect_macro_range_sweep(h4_bars, h1_bars, symbol="UNKNOWN", current_price=None, d1_bars=None, m5_bars=None):
+    """H1 liquidity sweep -> post-sweep M5 CHoCH; SL/TP remain HTF-derived."""
     sweep = _find_h1_sweep(h1_bars)
     if not sweep:
         return None
-    confirmation = _find_m15_choch(m15_bars or [], sweep)
+    confirmation = _find_m5_choch(m5_bars or [], sweep)
     if not confirmation:
         return None
 
@@ -196,8 +197,8 @@ def detect_macro_range_sweep(h4_bars, h1_bars, symbol="UNKNOWN", current_price=N
         return None
 
     # Select a reachable H1/H4/D1 liquidity magnet in the sweep direction.
-    # A countertrend setup is allowed only when the post-sweep M15 CHoCH confirms
-    # that same direction; _find_m15_choch() enforces this direction-specific break.
+    # Countertrend setups are allowed only when the post-sweep M5 CHoCH confirms
+    # the selected DOL direction; _find_m5_choch() enforces this directional break.
     target = _select_htf_target(direction, entry, h1_bars, h4_bars, d1_bars, sweep)
     if not target or not check_htf_liquidity_magnet(direction, entry, target, stop):
         return None
@@ -206,24 +207,24 @@ def detect_macro_range_sweep(h4_bars, h1_bars, symbol="UNKNOWN", current_price=N
     bias = calculate_daily_bias(d1_bars, h4_bars)
     alignment = classify_bias_alignment(direction, bias)
     return {
-        "setup_type": "H1_SWEEP_M15_CHOCH", "direction": direction,
+        "setup_type": "H1_SWEEP_M5_CHOCH", "direction": direction,
         "bias_alignment": alignment,
         "countertrend_confirmed": alignment == "COUNTERTREND",
         "dol_direction": direction,
-        "tf": "H1 Sweep / M15 CHoCH", "level": sweep["level"],
+        "tf": "H1 Sweep / M5 CHoCH", "confirmation_tf": "M5", "level": sweep["level"],
         "sweep_extreme": sweep["sweep_extreme"], "sweep_time": sweep["sweep_time"],
         "choch_level": confirmation["choch_level"], "bar_time": confirmation["bar_time"],
         "eq_level": (sweep["range_high"] + sweep["range_low"]) / 2,
         "daily_bias": bias, "qt_phase": get_quarterly_phase(), "entry": entry,
         "stop_loss": stop, "target_1": target["price"], "target_2": target["price"],
         "target_source": target["source"], "rr_ratio": round(rr, 2),
-        "confluence": "H1 liquidity sweep + M15 close-confirmed CHoCH + HTF DOL target",
+        "confluence": "H1 liquidity sweep + M5 close-confirmed CHoCH + HTF DOL target; SL/TP from HTF levels",
         "fvg_zone": "Not required"
     }
 
 
-def detect_sweep(d1_bars, h4_bars, h1_bars, symbol="UNKNOWN", current_price=None, m15_bars=None):
-    return detect_macro_range_sweep(h4_bars, h1_bars, symbol, current_price, d1_bars, m15_bars)
+def detect_sweep(d1_bars, h4_bars, h1_bars, symbol="UNKNOWN", current_price=None, m5_bars=None):
+    return detect_macro_range_sweep(h4_bars, h1_bars, symbol, current_price, d1_bars, m5_bars)
 
 
 def format_signal(symbol, event):
@@ -238,8 +239,8 @@ def format_signal(symbol, event):
         f"🧭 **DOL Direction:** `{event.get('dol_direction', event['direction'])}`\n\n"
         f"🕐 **Sweep:** H1 | Уровень: `{event['level']:.5f}`\n"
         f"🪝 **Экстремум закола:** `{event['sweep_extreme']:.5f}`\n"
-        f"🔁 **CHoCH:** M15 close за `{event['choch_level']:.5f}`\n"
-        f"💵 **Вход по закрытию M15:** `{event['entry']:.5f}`\n\n"
+        f"🔁 **CHoCH:** M5 close за `{event['choch_level']:.5f}`\n"
+        f"💵 **Ранний вход по закрытию M5:** `{event['entry']:.5f}`\n\n"
         f"🛑 **SL за экстремумом:** `{event['stop_loss']:.5f}`\n"
         f"🎯 **TP — ближайшая ликвидность:** `{event['target_1']:.5f}`\n"
         f"📐 **Потенциальный RR:** `{event['rr_ratio']:.2f}R`\n"
