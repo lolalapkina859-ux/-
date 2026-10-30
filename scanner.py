@@ -1,38 +1,59 @@
+import os
 import logging
 from datetime import datetime, timezone
 
 log = logging.getLogger("liquidity-hunter")
 
+# ==========================================
+# НАСТРОЙКИ (можно менять через Railway Variables)
+# ==========================================
+SL_ATR_MULT = float(os.getenv("SL_ATR_MULT", "0.4"))          # буфер стопа за уровнем = 0.4 * ATR(H4)
+MIN_RR = float(os.getenv("MIN_RR", "1.5"))                    # сигналы с RR ниже — не отправляются
+TP_MODE = os.getenv("TP_MODE", "range").strip().lower()       # "range" | "nearest"
+MAGNET_ATR_MULT = float(os.getenv("MAGNET_ATR_MULT", "1.0"))  # радиус HTF-магнита в ATR(H4)
+SWEEP_TOLERANCE = 0.0002                                      # допуск касания границы диапазона (0.02%)
+
+
+# ==========================================
+# 1. ИНДИКАТОРЫ И ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
+# ==========================================
 
 def calculate_atr(bars, period=14):
-    if not bars or len(bars) < period + 1:
+    """Average True Range."""
+    if len(bars) < period + 1:
         return 0.0
-    trs = []
+    tr_list = []
     for i in range(1, len(bars)):
-        high, low, prev_close = bars[i]["high"], bars[i]["low"], bars[i - 1]["close"]
-        trs.append(max(high - low, abs(high - prev_close), abs(low - prev_close)))
-    return sum(trs[-period:]) / period
+        high = bars[i]["high"]
+        low = bars[i]["low"]
+        prev_close = bars[i - 1]["close"]
+        tr_list.append(max(high - low, abs(high - prev_close), abs(low - prev_close)))
+    return sum(tr_list[-period:]) / period
 
 
-def _closed(bars, timeframe_seconds):
-    """Drop the most recent candle because providers commonly include a live candle."""
-    if not bars:
-        return []
-    now = datetime.now(timezone.utc).timestamp()
-    # Timestamps are candle-open timestamps for both supported providers.
-    return [b for b in bars if float(b.get("timestamp", 0)) + timeframe_seconds <= now]
+def fmt_price(p):
+    p = float(p)
+    if abs(p) >= 1000:
+        return f"{p:.2f}"
+    if abs(p) >= 10:
+        return f"{p:.3f}"
+    return f"{p:.5f}"
 
+
+# ==========================================
+# 2. DOL / ДИАПАЗОН / BIAS / QT
+# ==========================================
 
 def calculate_dol_levels(d1_bars, w1_bars=None):
     levels = {}
-    d1 = _closed(d1_bars, 86400)
-    w1 = _closed(w1_bars, 604800) if w1_bars else []
-    if d1:
-        levels["PDH"] = d1[-1]["high"]
-        levels["PDL"] = d1[-1]["low"]
-    if w1:
-        levels["PWH"] = w1[-1]["high"]
-        levels["PWL"] = w1[-1]["low"]
+    if d1_bars and len(d1_bars) >= 2:
+        prev_day = d1_bars[-2]
+        levels["PDH"] = prev_day["high"]
+        levels["PDL"] = prev_day["low"]
+    if w1_bars and len(w1_bars) >= 2:
+        prev_week = w1_bars[-2]
+        levels["PWH"] = prev_week["high"]
+        levels["PWL"] = prev_week["low"]
     return levels
 
 
@@ -40,265 +61,243 @@ def calculate_range_dynamics(bars, window=20):
     if not bars or len(bars) < window:
         return None
     recent = bars[-window:]
-    high = max(b["high"] for b in recent)
-    low = min(b["low"] for b in recent)
-    return {"range_high": high, "range_low": low, "eq_level": (high + low) / 2.0}
+    range_high = max(b["high"] for b in recent)
+    range_low = min(b["low"] for b in recent)
+    return {"range_high": range_high, "range_low": range_low,
+            "eq_level": (range_high + range_low) / 2.0}
 
 
 def get_quarterly_phase(dt=None):
     if dt is None:
         dt = datetime.now(timezone.utc)
     hour = dt.hour
-    if hour < 6:
+    if 0 <= hour < 6:
         return "Q1 (Accumulation)"
-    if hour < 12:
+    elif 6 <= hour < 12:
         return "Q2 (Manipulation)"
-    if hour < 18:
+    elif 12 <= hour < 18:
         return "Q3 (Distribution)"
     return "Q4 (Reversal/Continuation)"
 
 
 def calculate_daily_bias(d1_bars, h4_bars):
-    bars = _closed(h4_bars or [], 14400)
-    if len(bars) < 20:
+    if not h4_bars or len(h4_bars) < 20:
         return "NEUTRAL"
-    recent = bars[-1]["close"]
-    prior = bars[-10]["close"]
-    return "BEARISH" if recent < prior else "BULLISH" if recent > prior else "NEUTRAL"
+    if h4_bars[-1]["close"] < h4_bars[-10]["close"]:
+        return "BEARISH"
+    return "BULLISH"
 
 
-def _confirmed_pivots(bars, left=2, right=2):
+# ==========================================
+# 3. ПУЛЫ ЛИКВИДНОСТИ (свинги H1/H4, PDH/PDL)
+# ==========================================
+
+def find_swing_pools(bars, left=2, right=2, lookback=60):
+    """
+    Нетронутые (unswept) свинг-хаи и свинг-лоу — это и есть пулы ликвидности.
+    Свинг считается снятым, если любая более поздняя свеча зашла за него.
+    """
+    if not bars or len(bars) < left + right + 1:
+        return [], []
+    start = max(left, len(bars) - lookback)
     highs, lows = [], []
-    for i in range(left, len(bars) - right):
-        hi = bars[i]["high"]
-        lo = bars[i]["low"]
-        if all(hi > bars[j]["high"] for j in range(i-left, i)) and all(hi >= bars[j]["high"] for j in range(i+1, i+right+1)):
-            highs.append({"price": hi, "timestamp": bars[i]["timestamp"], "index": i})
-        if all(lo < bars[j]["low"] for j in range(i-left, i)) and all(lo <= bars[j]["low"] for j in range(i+1, i+right+1)):
-            lows.append({"price": lo, "timestamp": bars[i]["timestamp"], "index": i})
+    for i in range(start, len(bars) - right):
+        hi, lo = bars[i]["high"], bars[i]["low"]
+        left_bars = bars[i - left:i]
+        right_bars = bars[i + 1:i + 1 + right]
+        later = bars[i + 1:]
+        if all(hi > b["high"] for b in left_bars) and all(hi >= b["high"] for b in right_bars):
+            if max(b["high"] for b in later) <= hi:
+                highs.append(hi)
+        if all(lo < b["low"] for b in left_bars) and all(lo <= b["low"] for b in right_bars):
+            if min(b["low"] for b in later) >= lo:
+                lows.append(lo)
     return highs, lows
 
 
-def _find_h1_sweep(h1_bars, lookback=24, max_age_bars=3):
-    bars = _closed(h1_bars or [], 3600)
-    if len(bars) < lookback + 3:
-        return None
-    # Search only the latest few closed H1 candles; the reference range excludes the sweep candle.
-    start = max(lookback, len(bars) - max_age_bars)
-    for i in range(len(bars) - 1, start - 1, -1):
-        candle = bars[i]
-        prior = bars[i-lookback:i]
-        prior_high = max(b["high"] for b in prior)
-        prior_low = min(b["low"] for b in prior)
-        if candle["high"] > prior_high and candle["close"] < prior_high:
-            return {"direction": "SHORT", "level": prior_high, "sweep_extreme": candle["high"], "sweep_time": candle["timestamp"], "sweep_close_time": candle["timestamp"] + 3600, "range_high": prior_high, "range_low": prior_low, "sweep_bar": candle}
-        if candle["low"] < prior_low and candle["close"] > prior_low:
-            return {"direction": "LONG", "level": prior_low, "sweep_extreme": candle["low"], "sweep_time": candle["timestamp"], "sweep_close_time": candle["timestamp"] + 3600, "range_high": prior_high, "range_low": prior_low, "sweep_bar": candle}
-    return None
+def collect_pools(h4_bars, h1_bars=None, d1_bars=None):
+    h4_hi, h4_lo = find_swing_pools(h4_bars, 2, 2, 60)
+    htf_highs = [(p, "H4 swing high") for p in h4_hi]
+    htf_lows = [(p, "H4 swing low") for p in h4_lo]
+
+    if d1_bars and len(d1_bars) >= 2:
+        pdh, pdl = d1_bars[-2]["high"], d1_bars[-2]["low"]
+        today = d1_bars[-1]
+        if today["high"] <= pdh:
+            htf_highs.append((pdh, "PDH"))
+        if today["low"] >= pdl:
+            htf_lows.append((pdl, "PDL"))
+
+    h1_highs, h1_lows = [], []
+    if h1_bars:
+        hi, lo = find_swing_pools(h1_bars, 3, 3, 72)
+        h1_highs = [(p, "H1 swing high") for p in hi]
+        h1_lows = [(p, "H1 swing low") for p in lo]
+
+    return {"htf_highs": htf_highs, "htf_lows": htf_lows,
+            "h1_highs": h1_highs, "h1_lows": h1_lows}
 
 
-def _find_h4_sweep(h4_bars, lookback=20, max_age_bars=1):
-    """Find a confirmed H4 sweep of the preceding H4 range."""
-    bars = _closed(h4_bars or [], 14400)
-    if len(bars) < lookback + 2:
-        return None
-    # M5 history is limited, so only use the latest fully closed H4 candle.
-    start = max(lookback, len(bars) - max_age_bars)
-    for i in range(len(bars) - 1, start - 1, -1):
-        candle = bars[i]
-        prior = bars[i-lookback:i]
-        prior_high = max(b["high"] for b in prior)
-        prior_low = min(b["low"] for b in prior)
-        if candle["high"] > prior_high and candle["close"] < prior_high:
-            return {"direction": "SHORT", "level": prior_high, "sweep_extreme": candle["high"], "sweep_time": candle["timestamp"], "sweep_close_time": candle["timestamp"] + 14400, "range_high": prior_high, "range_low": prior_low, "sweep_bar": candle, "source_tf": "H4"}
-        if candle["low"] < prior_low and candle["close"] > prior_low:
-            return {"direction": "LONG", "level": prior_low, "sweep_extreme": candle["low"], "sweep_time": candle["timestamp"], "sweep_close_time": candle["timestamp"] + 14400, "range_high": prior_high, "range_low": prior_low, "sweep_bar": candle, "source_tf": "H4"}
-    return None
+def check_htf_liquidity_magnet(direction, level, atr, pools):
+    """
+    ФИЛЬТР СТАРШЕГО МАГНИТА (HTF DOL).
+    SHORT после снятия хая: если ВЫШЕ уровня закола лежит нетронутый HTF-пул
+    (H4 swing high / PDH) ближе MAGNET_ATR_MULT * ATR(H4) — цена, скорее всего,
+    тянется к нему, а стоп стоит прямо на пути. Сигнал блокируется.
+    LONG — зеркально по лоу.
+    Возвращает (ok, причина).
+    """
+    radius = atr * MAGNET_ATR_MULT
+    if direction == "SHORT":
+        above = [(p, lbl) for p, lbl in pools["htf_highs"] if p > level * (1 + SWEEP_TOLERANCE)]
+        if above:
+            p, lbl = min(above, key=lambda x: x[0])
+            if p - level <= radius:
+                return False, f"магнит сверху: {lbl} {fmt_price(p)}"
+    else:
+        below = [(p, lbl) for p, lbl in pools["htf_lows"] if p < level * (1 - SWEEP_TOLERANCE)]
+        if below:
+            p, lbl = max(below, key=lambda x: x[0])
+            if level - p <= radius:
+                return False, f"магнит снизу: {lbl} {fmt_price(p)}"
+    return True, None
 
 
-def _find_m5_choch(m5_bars, sweep, pivot_left=2, pivot_right=2):
-    """Use M5 only for structure confirmation after the source sweep candle closes."""
-    bars = _closed(m5_bars or [], 300)
-    post = [(i, b) for i, b in enumerate(bars) if b["timestamp"] >= sweep["sweep_close_time"]]
-    if len(post) < 5:
-        return None
-    highs, lows = _confirmed_pivots(bars, pivot_left, pivot_right)
-    direction = sweep["direction"]
-    # Give H4 setups a wider structure window; H1 setups retain the previous 6h window.
-    lookback_seconds = 12 * 3600 if sweep.get("source_tf") == "H4" else 6 * 3600
-    for original_i, candle in post:
-        prior_pivots = [p for p in (lows if direction == "SHORT" else highs) if p["index"] + pivot_right < original_i and p["timestamp"] >= sweep["sweep_close_time"] - lookback_seconds]
-        if not prior_pivots:
-            continue
-        pivot = prior_pivots[-1]
-        if direction == "SHORT" and candle["close"] < pivot["price"]:
-            return {"bar": candle, "bar_time": candle["timestamp"], "entry": candle["close"], "choch_level": pivot["price"]}
-        if direction == "LONG" and candle["close"] > pivot["price"]:
-            return {"bar": candle, "bar_time": candle["timestamp"], "entry": candle["close"], "choch_level": pivot["price"]}
-    return None
+# ==========================================
+# 4. ВЫБОР ТЕЙКА
+# ==========================================
+
+def choose_target(direction, entry, risk, range_low, range_high, pools):
+    """
+    TP_MODE="range"   -> противоположная граница диапазона 24H (классика).
+    TP_MODE="nearest" -> ближайший нетронутый пул ликвидности (H1/H4 swing, PDH/PDL),
+                         дающий RR >= MIN_RR; если такого нет — граница диапазона.
+    Возвращает (tp, подпись, tp2).
+    """
+    if direction == "SHORT":
+        boundary = range_low if range_low < entry else None
+        cands = [(p, l) for p, l in pools["htf_lows"] + pools["h1_lows"] if p < entry]
+        cands.sort(key=lambda x: -x[0])      # ближайшие к цене первыми
+        label = "нижняя граница диапазона 24H"
+    else:
+        boundary = range_high if range_high > entry else None
+        cands = [(p, l) for p, l in pools["htf_highs"] + pools["h1_highs"] if p > entry]
+        cands.sort(key=lambda x: x[0])
+        label = "верхняя граница диапазона 24H"
+
+    if TP_MODE == "nearest":
+        for price, lbl in cands:
+            if abs(price - entry) / risk >= MIN_RR:
+                far = boundary if boundary is not None and (
+                    (direction == "SHORT" and boundary < price) or
+                    (direction == "LONG" and boundary > price)) else None
+                return price, lbl, far
+
+    if boundary is not None:
+        return boundary, label, None
+    return None, None, None
 
 
-def _select_htf_target(direction, entry, h1_bars, h4_bars, d1_bars, fallback_range):
-    candidates = []
-    h1 = _closed(h1_bars or [], 3600)
-    h4 = _closed(h4_bars or [], 14400)
-    d1 = _closed(d1_bars or [], 86400)
-    for tf, bars in (("H1", h1[-120:]), ("H4", h4[-60:])):
-        ph, pl = _confirmed_pivots(bars, 2, 2)
-        pivots = ph if direction == "LONG" else pl
-        for p in pivots:
-            price = p["price"]
-            if (direction == "LONG" and price > entry) or (direction == "SHORT" and price < entry):
-                candidates.append({"price": price, "source": f"{tf} swing liquidity", "timestamp": p["timestamp"]})
-    if len(d1) >= 2:
-        # Previous fully closed daily candle is the second-last item if the current daily candle is present.
-        prev_day = d1[-1]
-        daily_level = prev_day["high"] if direction == "LONG" else prev_day["low"]
-        if (direction == "LONG" and daily_level > entry) or (direction == "SHORT" and daily_level < entry):
-            candidates.append({"price": daily_level, "source": "PDH" if direction == "LONG" else "PDL", "timestamp": prev_day["timestamp"]})
-    if fallback_range:
-        price = fallback_range["range_high"] if direction == "LONG" else fallback_range["range_low"]
-        if (direction == "LONG" and price > entry) or (direction == "SHORT" and price < entry):
-            candidates.append({"price": price, "source": f"{fallback_range.get('source_tf', 'H1')} range boundary", "timestamp": 0})
-    if not candidates:
-        return None
-    # Nearest valid liquidity pool in the trade direction.
-    return min(candidates, key=lambda c: abs(c["price"] - entry))
+# ==========================================
+# 5. ДЕТЕКТОР: SWEEP -> СТОП ЗА УРОВНЕМ -> ТЕЙК К ЛИКВИДНОСТИ
+# ==========================================
 
-
-def classify_bias_alignment(direction, bias):
-    """Label trend alignment; never rejects a setup by itself."""
-    if bias not in ("BULLISH", "BEARISH"):
-        return "NEUTRAL BIAS"
-    trend_direction = "LONG" if bias == "BULLISH" else "SHORT"
-    return "TREND-FOLLOWING" if direction == trend_direction else "COUNTERTREND"
-
-
-def target_is_in_direction(direction, entry, target):
-    """A DOL target must be beyond entry in the intended trade direction."""
-    if not target:
-        return False
-    return target["price"] > entry if direction == "LONG" else target["price"] < entry
-
-
-def check_htf_liquidity_magnet(direction, entry, target, stop_loss, min_rr=1.0):
-    """Require a valid HTF liquidity target and minimum reward/risk."""
-    risk = abs(entry - stop_loss)
-    if risk <= 0 or not target_is_in_direction(direction, entry, target):
-        log.info("HTF DOL filter: rejected, target is missing or not in trade direction")
-        return False
-    reward = abs(target["price"] - entry)
-    if reward / risk < min_rr:
-        log.info("HTF DOL filter: rejected, target reward is below %.2fR", min_rr)
-        return False
-    return True
-
-
-def detect_macro_range_sweep(h4_bars, h1_bars, symbol="UNKNOWN", current_price=None, d1_bars=None, m5_bars=None, spread_buffer=0.0):
-    """H4 or H1 liquidity sweep -> post-sweep M5 CHoCH; SL/TP use the selected sweep and HTF levels."""
-    h1_sweep = _find_h1_sweep(h1_bars)
-    if h1_sweep:
-        h1_sweep["source_tf"] = "H1"
-    h4_sweep = _find_h4_sweep(h4_bars)
-
-    candidates = []
-    # When an H1 sweep occurs inside the same H4 sweep candle and direction agrees,
-    # require M5 confirmation after the H4 candle closes and label the confluence.
-    same_h4_candle = bool(
-        h4_sweep and h1_sweep
-        and h4_sweep["direction"] == h1_sweep["direction"]
-        and h4_sweep["sweep_time"] <= h1_sweep["sweep_time"] < h4_sweep["sweep_close_time"]
-    )
-    if same_h4_candle:
-        combined = dict(h4_sweep)
-        combined["source_label"] = "H4 + H1"
-        candidates.append(combined)
-
-    if h1_sweep:
-        h1_sweep["source_label"] = "H1"
-        candidates.append(h1_sweep)
-    if h4_sweep:
-        h4_sweep["source_label"] = "H4"
-        candidates.append(h4_sweep)
-
-    # Prefer the most recent qualifying sweep. A combined H4+H1 candidate is retained
-    # as a stronger label when its post-H4-close M5 confirmation exists.
-    candidates.sort(key=lambda item: (item.get("source_label") == "H4 + H1", item["sweep_close_time"]), reverse=True)
-    selected = None
-    confirmation = None
-    for candidate in candidates:
-        found = _find_m5_choch(m5_bars or [], candidate)
-        if found:
-            selected, confirmation = candidate, found
-            break
-    if not selected:
+def detect_macro_range_sweep(h4_bars, h1_bars, symbol="UNKNOWN", current_price=None, d1_bars=None):
+    if not h4_bars or len(h4_bars) < 20 or not h1_bars or len(h1_bars) < 24:
         return None
 
-    sweep = selected
-    direction = sweep["direction"]
-    entry = confirmation["entry"]
-    h1_closed = _closed(h1_bars or [], 3600)
-    h4_closed = _closed(h4_bars or [], 14400)
-    d1_closed = _closed(d1_bars or [], 86400)
-    atr_source = h4_closed[-30:] if sweep["source_tf"] == "H4" else h1_closed[-30:]
-    atr = calculate_atr(atr_source, 14)
-    volatility_buffer = max(atr * 0.05, abs(entry) * 0.00005)
-    spread_buffer = max(0.0, float(spread_buffer or 0.0))
-    buffer = volatility_buffer + spread_buffer
-    stop = sweep["sweep_extreme"] + buffer if direction == "SHORT" else sweep["sweep_extreme"] - buffer
-    risk = abs(entry - stop)
-    if risk <= 0 or (direction == "LONG" and stop >= entry) or (direction == "SHORT" and stop <= entry):
+    h4_curr = h4_bars[-1]
+    entry = current_price if current_price and current_price > 0 else h1_bars[-1]["close"]
+
+    rd = calculate_range_dynamics(h1_bars, window=24)
+    if not rd:
+        return None
+    macro_high, macro_low, eq_level = rd["range_high"], rd["range_low"], rd["eq_level"]
+
+    if h4_curr["high"] >= macro_high * (1 - SWEEP_TOLERANCE):
+        direction, level = "SHORT", macro_high
+    elif h4_curr["low"] <= macro_low * (1 + SWEEP_TOLERANCE):
+        direction, level = "LONG", macro_low
+    else:
         return None
 
-    target = _select_htf_target(direction, entry, h1_bars, h4_bars, d1_bars, sweep)
-    if not target or not check_htf_liquidity_magnet(direction, entry, target, stop):
+    atr = calculate_atr(h4_bars, 14)
+    if atr <= 0:
+        atr = level * 0.003
+
+    pools = collect_pools(h4_bars, h1_bars, d1_bars)
+
+    ok, reason = check_htf_liquidity_magnet(direction, level, atr, pools)
+    if not ok:
+        log.info(f"🛡 [{symbol}] {direction} отфильтрован HTF-магнитом ({reason})")
         return None
-    reward = abs(target["price"] - entry)
-    rr = reward / risk
-    bias = calculate_daily_bias(d1_bars, h4_bars)
-    alignment = classify_bias_alignment(direction, bias)
-    source_label = sweep.get("source_label", sweep["source_tf"])
+
+    # СТОП СТРОГО ЗА УРОВНЕМ ЗАКОЛА + буфер на ATR(H4)
+    buffer = atr * SL_ATR_MULT
+    if direction == "SHORT":
+        stop_loss = level + buffer
+        risk = stop_loss - entry
+    else:
+        stop_loss = level - buffer
+        risk = entry - stop_loss
+    if risk <= 0:
+        return None
+
+    tp, tp_label, tp2 = choose_target(direction, entry, risk, macro_low, macro_high, pools)
+    if tp is None:
+        log.info(f"[{symbol}] нет цели с нужной стороны от входа — пропуск")
+        return None
+
+    rr = abs(tp - entry) / risk
+    if rr < MIN_RR:
+        log.info(f"[{symbol}] {direction}: RR {rr:.2f} < {MIN_RR} — пропуск")
+        return None
+
+    log.info(f"🚨 [{symbol}] SWEEP {direction} уровень {fmt_price(level)} RR {rr:.2f}")
+
     return {
-        "setup_type": f"{source_label.replace(' + ', '_')}_SWEEP_M5_CHOCH", "direction": direction,
-        "bias_alignment": alignment, "countertrend_confirmed": alignment == "COUNTERTREND",
-        "dol_direction": direction, "tf": f"{source_label} Sweep / M5 CHoCH",
-        "sweep_source_tf": source_label, "confirmation_tf": "M5", "level": sweep["level"],
-        "sweep_extreme": sweep["sweep_extreme"], "sweep_time": sweep["sweep_time"],
-        "bar_time": confirmation["bar_time"], "choch_level": confirmation["choch_level"],
-        "eq_level": (sweep["range_high"] + sweep["range_low"]) / 2,
-        "daily_bias": bias, "qt_phase": get_quarterly_phase(), "entry": entry,
-        "stop_loss": stop, "target_1": target["price"], "target_2": target["price"],
-        "volatility_buffer": volatility_buffer, "spread_buffer": spread_buffer,
-        "target_source": target["source"], "rr_ratio": round(rr, 2),
-        "confluence": f"{source_label} liquidity sweep + M5 close-confirmed CHoCH + HTF DOL target; SL/TP from HTF levels",
-        "fvg_zone": "Not required"
+        "setup_type": "PRICE_ACTION_SWEEP",
+        "direction": direction,
+        "tf": "1H / 4H Price Action",
+        "level": level,
+        "eq_level": eq_level,
+        "daily_bias": calculate_daily_bias(d1_bars, h4_bars) if d1_bars else "NEUTRAL",
+        "qt_phase": get_quarterly_phase(),
+        "entry": entry,
+        "stop_loss": stop_loss,
+        "target_1": tp,
+        "target_2": tp2,
+        "tp_label": tp_label,
+        "rr_ratio": round(rr, 2),
+        "atr_h4": atr,
+        "bar_time": h4_curr["timestamp"],
     }
 
 
-def detect_sweep(d1_bars, h4_bars, h1_bars, symbol="UNKNOWN", current_price=None, m5_bars=None, spread_buffer=0.0):
-    return detect_macro_range_sweep(h4_bars, h1_bars, symbol, current_price, d1_bars, m5_bars, spread_buffer)
+def detect_sweep(d1_bars, h4_bars, h1_bars, symbol="UNKNOWN", current_price=None):
+    return detect_macro_range_sweep(h4_bars, h1_bars, symbol, current_price, d1_bars)
 
 
-def format_signal(symbol, event):
-    emoji = "🟢" if event["direction"] == "LONG" else "🔴"
-    return (
-        f"{emoji} **LIQUIDITY HUNTER FX — CONFIRMED SETUP**\n\n"
-        f"🪙 **Инструмент:** `{symbol}`\n"
-        f"📊 **Направление:** `{event['direction']}`\n"
-        f"🧭 **HTF Bias:** `{event['daily_bias']}`\n"
-        f"🧩 **Setup Alignment:** `{event.get('bias_alignment', 'UNCLASSIFIED')}`\n"
-        f"🎯 **HTF DOL / TP:** `{event['target_source']}`\n"
-        f"🧭 **DOL Direction:** `{event.get('dol_direction', event['direction'])}`\n\n"
-        f"🕐 **Sweep:** {event.get('sweep_source_tf', 'H1')} | Уровень: `{event['level']:.5f}`\n"
-        f"🪝 **Экстремум закола:** `{event['sweep_extreme']:.5f}`\n"
-        f"🔁 **CHoCH:** M5 close за `{event['choch_level']:.5f}`\n"
-        f"💵 **Ранний вход по закрытию M5:** `{event['entry']:.5f}`\n\n"
-        f"🛑 **SL за экстремумом:** `{event['stop_loss']:.5f}`\n"
-        f"↔️ **Резерв спреда:** `{event.get('spread_buffer', 0.0):.5f}` (добавлен к буферу волатильности)\n"
-        f"🎯 **TP — ближайшая ликвидность:** `{event['target_1']:.5f}`\n"
-        f"📐 **Потенциальный RR:** `{event['rr_ratio']:.2f}R`\n"
+# ==========================================
+# 6. ФОРМАТ СООБЩЕНИЯ
+# ==========================================
+
+def format_signal(symbol, event, time_str=""):
+    msg = (
+        f"🚨 **PRICE ACTION SIGNAL: {symbol}** 🚨\n\n"
+        f"📈 Направление: `{event['direction']}`\n"
+        f"🎯 Триггер: Снятие ликвидности диапазона 24H (H1/H4)\n"
+        f"📍 Уровень закола: `{fmt_price(event['level'])}`\n"
+        f"💵 Цена входа: `{fmt_price(event['entry'])}`\n"
+        f"🛡 Стоп-Лосс (SL): `{fmt_price(event['stop_loss'])}` (за уровнем + {SL_ATR_MULT} ATR H4)\n"
+        f"🎯 Тейк-Профит (TP): `{fmt_price(event['target_1'])}` ({event['tp_label']})\n"
     )
-
-
-def format_confirmed_signal(symbol, event, current_price=None):
-    return format_signal(symbol, event)
+    if event.get("target_2") is not None:
+        msg += f"🚀 TP2: `{fmt_price(event['target_2'])}` (граница диапазона)\n"
+    msg += (
+        f"⚖️ RR: `1:{event['rr_ratio']}`\n"
+        f"📅 Bias: `{event['daily_bias']}` | ⌛ QT: `{event['qt_phase']}`\n"
+    )
+    if time_str:
+        msg += f"⏱ Время: {time_str}"
+    return msg

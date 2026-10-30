@@ -1,128 +1,139 @@
+import os
 import sqlite3
 import logging
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
+
+from scanner import fmt_price
 
 log = logging.getLogger("liquidity-tracker")
-DB_NAME = "trades_history.db"
+# Для Railway: подключи Volume и поставь DB_PATH=/data/trades_history.db, иначе БД стирается при деплое
+DB_NAME = os.getenv("DB_PATH", "trades_history.db")
+LOCAL_TZ = ZoneInfo(os.getenv("LOCAL_TZ", "Europe/Kyiv"))
+
 
 def init_db():
     conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute('''
+    conn.execute('''
         CREATE TABLE IF NOT EXISTS trades (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            symbol TEXT,
-            tf TEXT,
-            direction TEXT,
-            entry_price REAL,
-            stop_loss REAL,
-            target REAL,
-            rr_ratio REAL,
+            symbol TEXT, tf TEXT, direction TEXT,
+            entry_price REAL, stop_loss REAL, target REAL, rr_ratio REAL,
             status TEXT DEFAULT 'OPEN',
-            created_at TIMESTAMP
+            created_at TEXT
         )
     ''')
     conn.commit()
     conn.close()
 
+
 def save_signal(symbol, tf, direction, entry_price, stop_loss, target, rr_ratio):
     conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute('''
+    conn.execute('''
         INSERT INTO trades (symbol, tf, direction, entry_price, stop_loss, target, rr_ratio, status, created_at)
         VALUES (?, ?, ?, ?, ?, ?, ?, 'OPEN', ?)
-    ''', (symbol, tf, direction, entry_price, stop_loss, target, rr_ratio, datetime.now(timezone.utc)))
+    ''', (symbol, tf, direction, entry_price, stop_loss, target, rr_ratio,
+          datetime.now(timezone.utc).isoformat()))
     conn.commit()
     conn.close()
 
-def check_open_trades(current_prices, telegram_callback):
+
+def has_open_trade(symbol):
+    conn = sqlite3.connect(DB_NAME)
+    n = conn.execute("SELECT COUNT(*) FROM trades WHERE symbol = ? AND status = 'OPEN'", (symbol,)).fetchone()[0]
+    conn.close()
+    return n > 0
+
+
+def _parse_dt(value):
+    dt = value if isinstance(value, datetime) else datetime.fromisoformat(str(value))
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+def check_open_trades(get_bars_fn, telegram_callback):
     """
-    current_prices = {"BTC / USDT": {"high": 84000, "low": 83000, "close": 83500}, ...}
+    get_bars_fn(symbol) -> список свечей M5 (только для проверки исхода, не для стопов).
+    Учитываются ТОЛЬКО свечи, открывшиеся после времени сигнала.
+    Если в одной свече задеты и SL, и TP — засчитывается стоп (консервативно).
     """
     conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    # Добавили выборку entry_price и created_at для точной идентификации сетапа
-    cursor.execute("SELECT id, symbol, tf, direction, entry_price, stop_loss, target, rr_ratio, created_at FROM trades WHERE status = 'OPEN'")
-    open_trades = cursor.fetchall()
+    cur = conn.cursor()
+    cur.execute("SELECT id, symbol, tf, direction, entry_price, stop_loss, target, rr_ratio, created_at "
+                "FROM trades WHERE status = 'OPEN'")
+    open_trades = cur.fetchall()
+    bars_cache = {}
 
-    for trade in open_trades:
-        trade_id, symbol, tf, direction, entry_price, sl, tp, rr, created_at = trade
-        if symbol not in current_prices:
+    for trade_id, symbol, tf, direction, entry, sl, tp, rr, created_at in open_trades:
+        try:
+            created_dt = _parse_dt(created_at)
+        except Exception:
+            log.warning("Bad created_at for trade %s: %s", trade_id, created_at)
+            continue
+        created_ts = created_dt.timestamp()
+
+        if symbol not in bars_cache:
+            try:
+                bars_cache[symbol] = get_bars_fn(symbol)
+            except Exception as exc:
+                log.warning("%s: tracking fetch failed: %s", symbol, exc)
+                bars_cache[symbol] = None
+        bars = bars_cache[symbol]
+        if not bars:
             continue
 
-        price_data = current_prices[symbol]
-        high = price_data['high']
-        low = price_data['low']
+        outcome = None
+        for b in bars:
+            if b["timestamp"] < created_ts:
+                continue
+            if direction == "LONG":
+                hit_sl, hit_tp = b["low"] <= sl, b["high"] >= tp
+            else:
+                hit_sl, hit_tp = b["high"] >= sl, b["low"] <= tp
+            if hit_sl:
+                outcome = "LOSS"
+                break
+            if hit_tp:
+                outcome = "WIN"
+                break
 
-        status_update = None
+        if not outcome:
+            continue
 
-        if direction == "LONG":
-            if high >= tp:
-                status_update = "WIN"
-            elif low <= sl:
-                status_update = "LOSS"
-        elif direction == "SHORT":
-            if low <= tp:
-                status_update = "WIN"
-            elif high >= sl:
-                status_update = "LOSS"
+        cur.execute("UPDATE trades SET status = ? WHERE id = ?", (outcome, trade_id))
+        conn.commit()
 
-        if status_update:
-            cursor.execute("UPDATE trades SET status = ? WHERE id = ?", (status_update, trade_id))
-            conn.commit()
-            
-            # Красиво форматируем время создания сетапа
-            time_str = ""
-            if created_at:
-                try:
-                    if isinstance(created_at, str):
-                        dt_obj = datetime.fromisoformat(created_at)
-                    else:
-                        dt_obj = created_at
-                    time_str = dt_obj.astimezone(timezone(timedelta(hours=3))).strftime('%H:%M:%S')
-                except Exception:
-                    time_str = str(created_at)[:19]
-
-            icon = "🟢 TARGET HIT! ✅" if status_update == "WIN" else "🔴 STOP LOSS HIT ❌"
-            profit_str = f"+{rr}R" if status_update == "WIN" else "-1.0R"
-            
-            # Детализированное сообщение с указанием конкретной цены входа
-            msg = (
-                f"📊 **ОТРАБОТКА СЕТАПА** [{symbol}]\n"
-                f"📈 Направление: `{direction}` | TF: `{tf}`\n"
-                f"💵 Цена входа: `{entry_price:.5f}`\n"
-                f"⏱ Время сигнала: `{time_str}`\n"
-                f"Результат: {icon}\n"
-                f"Профит: `{profit_str}`"
-            )
-            telegram_callback(msg)
+        time_str = created_dt.astimezone(LOCAL_TZ).strftime('%Y-%m-%d %H:%M:%S')
+        icon = "🟢 TARGET HIT! ✅" if outcome == "WIN" else "🔴 STOP LOSS HIT ❌"
+        profit = f"+{rr}R" if outcome == "WIN" else "-1.0R"
+        telegram_callback(
+            f"📊 **ОТРАБОТКА СЕТАПА** [{symbol}]\n"
+            f"📈 Направление: `{direction}` | TF: `{tf}`\n"
+            f"💵 Цена входа: `{fmt_price(entry)}`\n"
+            f"⏱ Время сигнала: `{time_str}`\n"
+            f"Результат: {icon}\n"
+            f"Профит: `{profit}`"
+        )
 
     conn.close()
+
 
 def get_stats_summary():
     conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    
-    cursor.execute("SELECT COUNT(*) FROM trades WHERE status = 'WIN'")
-    wins = cursor.fetchone()[0]
-    
-    cursor.execute("SELECT COUNT(*) FROM trades WHERE status = 'LOSS'")
-    losses = cursor.fetchone()[0]
-    
-    cursor.execute("SELECT SUM(rr_ratio) FROM trades WHERE status = 'WIN'")
-    win_rr = cursor.fetchone()[0] or 0.0
-
-    total = wins + losses
-    winrate = round((wins / total) * 100, 1) if total > 0 else 0.0
-    total_r = round(win_rr - losses, 1)
-
+    cur = conn.cursor()
+    wins = cur.execute("SELECT COUNT(*) FROM trades WHERE status = 'WIN'").fetchone()[0]
+    losses = cur.execute("SELECT COUNT(*) FROM trades WHERE status = 'LOSS'").fetchone()[0]
+    win_rr = cur.execute("SELECT SUM(rr_ratio) FROM trades WHERE status = 'WIN'").fetchone()[0] or 0.0
     conn.close()
-
+    total = wins + losses
+    winrate = round((wins / total) * 100, 1) if total else 0.0
+    total_r = round(win_rr - losses, 2)
     return (
         f"📈 **СТАТИСТИКА ОТРАБОТКИ СИГНАЛОВ**\n\n"
-        f"🎯 Всего закрыто сетапов: {total}\n"
-        f"✅ Успешных (WIN): {wins}\n"
-        f"❌ Неуспешных (LOSS): {losses}\n"
-        f"🔥 **Винрейт (Winrate): {winrate}%**\n"
-        f"💰 **Суммарный профит: +{total_r}R**"
+        f"🎯 Закрыто сетапов: {total}\n"
+        f"✅ WIN: {wins}\n"
+        f"❌ LOSS: {losses}\n"
+        f"🔥 **Winrate: {winrate}%**\n"
+        f"💰 **Суммарно: {total_r:+}R**"
     )

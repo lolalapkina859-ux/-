@@ -13,18 +13,18 @@ import time
 import logging
 import requests
 from datetime import datetime, timezone, timedelta
+from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
 import yfinance as yf
 from scanner import (
-    detect_sweep, 
-    format_signal, 
-    format_confirmed_signal, 
+    detect_sweep,
+    format_signal,
     calculate_daily_bias,
     get_quarterly_phase,
     calculate_range_dynamics,
-    calculate_dol_levels
+    calculate_dol_levels,
 )
-from tracker import init_db, save_signal, check_open_trades
+from tracker import init_db, save_signal, check_open_trades, has_open_trade
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -33,29 +33,7 @@ log = logging.getLogger("liquidity-hunter")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 SCAN_SECONDS = int(os.getenv("SCAN_INTERVAL_SECONDS", "60"))
-
-# Spread reserves are in raw price units (not pips). These are conservative defaults,
-# not live FxPro spreads; set SPREAD_BUFFER_<KEY> in Railway variables to tune them.
-SPREAD_BUFFER_DEFAULTS = {
-    "BTC_USDT": 10.0, "ETH_USDT": 1.0, "SOL_USDT": 0.10,
-    "XAU_USD": 0.50, "XAG_USD": 0.03, "USOIL_USD": 0.05,
-    "US500_USD": 0.50, "EUR_USD": 0.00015, "GBP_USD": 0.00015,
-    "USD_JPY": 0.015,
-}
-
-def get_spread_buffer(display_symbol):
-    key = display_symbol.replace(" / ", "_").replace(" ", "_").upper()
-    raw = os.getenv(f"SPREAD_BUFFER_{key}")
-    if raw is None:
-        return SPREAD_BUFFER_DEFAULTS.get(key, 0.0)
-    try:
-        value = float(raw)
-        if value < 0:
-            raise ValueError("spread buffer must be non-negative")
-        return value
-    except ValueError as exc:
-        raise ValueError(f"Invalid SPREAD_BUFFER_{key}: {raw!r}; expected non-negative price value") from exc
-
+LOCAL_TZ = ZoneInfo(os.getenv("LOCAL_TZ", "Europe/Kyiv"))
 
 SYMBOLS = {
     "DXY": {"source": "yfinance", "ticker": "DX-Y.NYB"},
@@ -73,101 +51,103 @@ SYMBOLS = {
 
 last_alerts = set()
 symbol_cooldown = {}
-COOLDOWN_SECONDS = 1800  # 30 минут кулдаун
-PENDING_TIMEOUT = 900     # 15 минут на сброс зависшего сетапа
-pending_setups = {}
+COOLDOWN_SECONDS = 1800  # 30 минут кулдаун на инструмент
+_bars_cache = {}
+CACHE_TTL = {"1d": 3600, "4h": 55, "1h": 55, "5m": 25}
 
 
 def telegram(message):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     try:
-        response = requests.post(
-            url, 
-            json={"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "Markdown"}, 
-            timeout=15
-        )
-        response.raise_for_status()
+        r = requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "Markdown"}, timeout=15)
+        if r.status_code == 400:  # ошибка разметки — шлём без форматирования, чтобы не потерять сигнал
+            r = requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": message.replace("*", "").replace("`", "")}, timeout=15)
+        r.raise_for_status()
     except Exception:
         log.exception("Telegram delivery failed")
 
 
 def fetch_bingx_bars(symbol, interval_str):
-    interval_map = {"1d": "1d", "4h": "4h", "1h": "1h", "15m": "15m", "5m": "5m"}
+    interval_map = {"1d": "1d", "4h": "4h", "1h": "1h", "5m": "5m"}
     bx_interval = interval_map.get(interval_str, "1h")
-    url = f"https://open-api.bingx.com/openApi/swap/v2/quote/klines?symbol={symbol}&interval={bx_interval}&limit=100"
+    limit = 1000 if interval_str == "5m" else 100  # длинная история M5 нужна только трекеру
+    url = f"https://open-api.bingx.com/openApi/swap/v2/quote/klines?symbol={symbol}&interval={bx_interval}&limit={limit}"
     resp = requests.get(url, timeout=15)
     resp.raise_for_status()
     data = resp.json()
     if data.get("code") != 0 or not data.get("data"):
         raise RuntimeError(f"BingX API error for {symbol}: {data}")
-    bars = []
-    for row in data["data"]:
-        bars.append({
-            "timestamp": int(row["time"] / 1000),
-            "open": float(row["open"]),
-            "high": float(row["high"]),
-            "low": float(row["low"]),
-            "close": float(row["close"]),
-        })
+    bars = [{
+        "timestamp": int(row["time"] / 1000),
+        "open": float(row["open"]),
+        "high": float(row["high"]),
+        "low": float(row["low"]),
+        "close": float(row["close"]),
+    } for row in data["data"]]
     bars.sort(key=lambda b: b["timestamp"])
     return bars
 
 
 def aggregate_1h_to_4h(h1_bars):
-    if not h1_bars:
-        return []
-    h4_bars = []
-    chunk_size = 4
-    for i in range(0, len(h1_bars), chunk_size):
-        chunk = h1_bars[i:i + chunk_size]
-        if not chunk:
-            continue
-        h4_bars.append({
-            "timestamp": chunk[0]["timestamp"],
+    """Склейка H1 -> H4 по реальным границам 4-часовых свечей (UTC 00/04/08/12/16/20)."""
+    buckets = {}
+    for b in h1_bars:
+        buckets.setdefault(b["timestamp"] // 14400, []).append(b)
+    h4 = []
+    for key in sorted(buckets):
+        chunk = buckets[key]
+        h4.append({
+            "timestamp": key * 14400,
             "open": chunk[0]["open"],
             "high": max(b["high"] for b in chunk),
             "low": min(b["low"] for b in chunk),
             "close": chunk[-1]["close"],
         })
-    return h4_bars
+    return h4
 
 
 def fetch_yfinance_bars(ticker_str, interval_str):
-    period_map = {"1d": "350d", "4h": "60d", "1h": "60d", "15m": "60d", "5m": "7d"}
+    period_map = {"1d": "350d", "4h": "60d", "1h": "60d", "15m": "14d", "5m": "7d"}
     period = period_map.get(interval_str, "60d")
-    
-    if interval_str == "1d":
-        yf_interval = "1d"
-    elif interval_str == "15m":
-        yf_interval = "15m"
-    elif interval_str == "5m":
-        yf_interval = "5m"
-    else:
-        yf_interval = "1h"
-    
+    yf_interval = {"1d": "1d", "15m": "15m", "5m": "5m"}.get(interval_str, "1h")
+
     df = yf.download(ticker_str, period=period, interval=yf_interval, progress=False)
     if df.empty:
         raise RuntimeError(f"Empty data from yfinance for {ticker_str}")
     if hasattr(df.columns, 'levels') and len(df.columns.levels) > 1:
         df.columns = df.columns.get_level_values(0)
-    bars = []
-    for idx, row in df.iterrows():
-        bars.append({
-            "timestamp": int(idx.timestamp()),
-            "open": float(row["Open"]),
-            "high": float(row["High"]),
-            "low": float(row["Low"]),
-            "close": float(row["Close"]),
-        })
+    bars = [{
+        "timestamp": int(idx.timestamp()),
+        "open": float(row["Open"]),
+        "high": float(row["High"]),
+        "low": float(row["Low"]),
+        "close": float(row["Close"]),
+    } for idx, row in df.iterrows()]
     bars.sort(key=lambda b: b["timestamp"])
-    
     if interval_str == "4h":
         return aggregate_1h_to_4h(bars)
     return bars
 
 
+def get_bars(source, ticker, tf):
+    """Загрузка свечей с кэшем. H4 для yfinance строится из уже загруженного H1 (без лишнего запроса)."""
+    key = (source, ticker, tf)
+    now = time.time()
+    hit = _bars_cache.get(key)
+    if hit and now - hit[0] < CACHE_TTL.get(tf, 55):
+        return hit[1]
+    if source == "yfinance" and tf == "4h":
+        bars = aggregate_1h_to_4h(get_bars(source, ticker, "1h"))
+    elif source == "bingx":
+        bars = fetch_bingx_bars(ticker, tf)
+    else:
+        bars = fetch_yfinance_bars(ticker, tf)
+    _bars_cache[key] = (now, bars)
+    return bars
+
+
 def get_macro_news_narrative():
-    local_tz = timezone(timedelta(hours=3))
+    local_tz = LOCAL_TZ
     raw_events = [
         {"day": "Среда, 28 окт", "utc_hour": 21, "utc_min": 0, "event": "API / Crude Oil Inventories", "impact": "Medium"},
         {"day": "Четверг, 29 окт", "utc_hour": 1, "utc_min": 0, "event": "Federal Funds Rate & FOMC Statement", "impact": "HIGH 🔴"},
@@ -234,7 +214,7 @@ def send_gold_morning_analysis():
         report += (
             f"📍 **РЕЖИМ РАБОТЫ:**\n"
             f"• Бот настроен на поиск чистых **Sweep + Shift (CHoCH)** без ожидания сложных зон FVG/OB.\n"
-            f"• Сигнал требует H4 или H1 Sweep и подтверждённый M5 CHoCH в сторону выбранной цели HTF DOL; SL/TP рассчитываются по HTF-уровням."
+            f"• Сигналы отправляются сразу при сломе структуры на M5 после снятия ликвидности."
         )
 
         telegram(report)
@@ -285,85 +265,57 @@ def send_btc_morning_analysis():
         log.exception(f"Ошибка анализа BTC: {e}")
 
 
-def cleanup_expired_pending(current_time):
-    to_delete = []
-    for symbol, setup in pending_setups.items():
-        if current_time - setup.get("created_at", current_time) > PENDING_TIMEOUT:
-            to_delete.append(symbol)
-    for symbol in to_delete:
-        del pending_setups[symbol]
+def fetch_m5_for_tracking(symbol):
+    """M5 используется ТОЛЬКО чтобы честно проверить, что цена сделала после входа. На стопы/тейки не влияет."""
+    info = SYMBOLS[symbol]
+    return get_bars(info["source"], info["ticker"], "5m")
 
 
 def scan_once():
-    log.info("--- Starting scan cycle (H4/H1 Sweep / M5 CHoCH / HTF DOL SL/TP) ---")
-    current_time = time.time()
-    current_prices = {}
-    cleanup_expired_pending(current_time)
+    log.info("--- Starting scan cycle (H1/H4 Price Action) ---")
+    now = time.time()
+    if len(last_alerts) > 500:
+        last_alerts.clear()
 
     for display_symbol, info in SYMBOLS.items():
         if display_symbol == "DXY":
             continue
         try:
-            source = info["source"]
-            ticker = info["ticker"]
-            fetch = fetch_bingx_bars if source == "bingx" else fetch_yfinance_bars
+            if now - symbol_cooldown.get(display_symbol, 0) < COOLDOWN_SECONDS:
+                continue
+            if has_open_trade(display_symbol):
+                continue  # пока сделка по инструменту не закрыта — новых сигналов нет
 
-            d1 = fetch(ticker, "1d")
-            time.sleep(0.12)
-            h4 = fetch(ticker, "4h")
-            time.sleep(0.12)
-            h1 = fetch(ticker, "1h")
-            time.sleep(0.12)
-            m5 = fetch(ticker, "5m")
-            time.sleep(0.12)
-
-            if h1:
-                current_prices[display_symbol] = {
-                    "high": h1[-1]["high"],
-                    "low": h1[-1]["low"],
-                    "close": h1[-1]["close"]
-                }
-
-            # Keep updating tracked positions even while a new-signal cooldown is active.
-            if current_time - symbol_cooldown.get(display_symbol, 0) < COOLDOWN_SECONDS:
+            source, ticker = info["source"], info["ticker"]
+            d1 = get_bars(source, ticker, "1d")
+            h4 = get_bars(source, ticker, "4h")
+            h1 = get_bars(source, ticker, "1h")
+            if not h1 or not h4:
                 continue
 
-            event = detect_sweep(
-                d1, h4, h1, display_symbol,
-                current_price=(h1[-1]["close"] if h1 else None),
-                m5_bars=m5,
-                spread_buffer=get_spread_buffer(display_symbol)
-            )
+            price = h1[-1]["close"]
+            event = detect_sweep(d1, h4, h1, display_symbol, current_price=price)
             if not event:
                 continue
 
-            key = f"{display_symbol}:{event['direction']}:{event['sweep_time']}:{event['bar_time']}"
+            key = f"{display_symbol}:{event['direction']}:{event['bar_time']}"
             if key in last_alerts:
                 continue
-
-            # Entry, SL and TP are calculated by scanner from the confirmed M5 close,
-            # actual selected H1/H4 sweep wick and nearest eligible H1/H4/D1 liquidity target.
-            signal_msg = format_signal(display_symbol, event)
-            telegram(signal_msg)
-            save_signal(
-                display_symbol, event["tf"], event["direction"],
-                event["entry"], event["stop_loss"], event["target_1"],
-                event["rr_ratio"]
-            )
             last_alerts.add(key)
-            symbol_cooldown[display_symbol] = current_time
-            log.info(
-                "[%s] %s confirmed (M5 CHoCH / HTF SL-TP): entry=%.8f SL=%.8f TP=%.8f RR=%.2f",
-                display_symbol, event["direction"], event["entry"],
-                event["stop_loss"], event["target_1"], event["rr_ratio"]
-            )
+
+            save_signal(display_symbol, event["tf"], event["direction"], event["entry"],
+                        event["stop_loss"], event["target_1"], event["rr_ratio"])
+            telegram(format_signal(display_symbol, event, datetime.now(LOCAL_TZ).strftime("%H:%M:%S")))
+            symbol_cooldown[display_symbol] = now
             time.sleep(0.2)
         except Exception as exc:
-            log.exception("%s: scan failed: %s", display_symbol, exc)
+            log.warning("%s: scan failed: %s", display_symbol, exc)
             time.sleep(0.2)
 
-    if current_prices:
-        check_open_trades(current_prices, telegram)
+    try:
+        check_open_trades(fetch_m5_for_tracking, telegram)
+    except Exception:
+        log.exception("check_open_trades failed")
     log.info("--- Scan cycle finished ---")
 
 
@@ -372,11 +324,11 @@ def main():
         raise SystemExit("Missing Telegram env vars.")
     init_db()
     log.info("Database initialized successfully.")
-    
+
     send_gold_morning_analysis()
     time.sleep(2)
     send_btc_morning_analysis()
-    
+
     while True:
         scan_once()
         time.sleep(SCAN_SECONDS)
