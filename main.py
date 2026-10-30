@@ -17,7 +17,8 @@ from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
 import yfinance as yf
 from scanner import (
-    detect_sweep,
+    detect_crt_setup,
+    CRT_TF,
     format_signal,
     calculate_daily_bias,
     get_quarterly_phase,
@@ -40,7 +41,7 @@ SYMBOLS = {
     "BTC / USDT": {"source": "bingx", "ticker": "BTC-USDT"},
     "ETH / USDT": {"source": "bingx", "ticker": "ETH-USDT"},
     "SOL / USDT": {"source": "bingx", "ticker": "SOL-USDT"},
-    "XAU / USD": {"source": "yfinance", "ticker": "XAUT-USD"},
+    "XAU / USD": {"source": "yfinance", "ticker": os.getenv("GOLD_TICKER", "XAUUSD=X")},
     "XAG / USD": {"source": "yfinance", "ticker": "SI=F"},
     "USOIL / USD": {"source": "yfinance", "ticker": "CL=F"},
     "US500 / USD": {"source": "yfinance", "ticker": "SPY"},
@@ -48,6 +49,9 @@ SYMBOLS = {
     "GBP / USD": {"source": "yfinance", "ticker": "GBPUSD=X"},
     "USD / JPY": {"source": "yfinance", "ticker": "USDJPY=X"},
 }
+
+# Какие инструменты сканировать (через запятую, Railway Variables). По умолчанию только золото.
+ACTIVE_SYMBOLS = [x.strip() for x in os.getenv("ACTIVE_SYMBOLS", "XAU / USD").split(",") if x.strip()]
 
 last_alerts = set()
 symbol_cooldown = {}
@@ -213,8 +217,8 @@ def send_gold_morning_analysis():
         report += f"\n{get_macro_news_narrative()}\n"
         report += (
             f"📍 **РЕЖИМ РАБОТЫ:**\n"
-            f"• Бот настроен на поиск чистых **Sweep + Shift (CHoCH)** без ожидания сложных зон FVG/OB.\n"
-            f"• Сигналы отправляются сразу при сломе структуры на M5 после снятия ликвидности."
+            f"• Стратегия **CRT + Turtle Soup**: свеча-диапазон {CRT_TF.upper()}, прокол её хая/лоя, возврат внутрь.\n"
+            f"• Вход только после слома структуры на M5, лимиткой на откате. SL за проколом, цели: EQ и граница диапазона."
         )
 
         telegram(report)
@@ -272,29 +276,27 @@ def fetch_m5_for_tracking(symbol):
 
 
 def scan_once():
-    log.info("--- Starting scan cycle (H1/H4 Price Action) ---")
+    log.info(f"--- Starting scan cycle (CRT {CRT_TF.upper()} + M5 Turtle Soup) ---")
     now = time.time()
     if len(last_alerts) > 500:
         last_alerts.clear()
 
     for display_symbol, info in SYMBOLS.items():
-        if display_symbol == "DXY":
+        if display_symbol not in ACTIVE_SYMBOLS:
             continue
         try:
             if now - symbol_cooldown.get(display_symbol, 0) < COOLDOWN_SECONDS:
                 continue
             if has_open_trade(display_symbol):
-                continue  # пока сделка по инструменту не закрыта — новых сигналов нет
+                continue  # пока ордер ждёт входа или сделка открыта — новых сигналов нет
 
             source, ticker = info["source"], info["ticker"]
-            d1 = get_bars(source, ticker, "1d")
-            h4 = get_bars(source, ticker, "4h")
-            h1 = get_bars(source, ticker, "1h")
-            if not h1 or not h4:
+            crt_bars = get_bars(source, ticker, CRT_TF)
+            m5 = get_bars(source, ticker, "5m")
+            if not crt_bars or not m5:
                 continue
 
-            price = h1[-1]["close"]
-            event = detect_sweep(d1, h4, h1, display_symbol, current_price=price)
+            event = detect_crt_setup(crt_bars, m5, display_symbol)
             if not event:
                 continue
 
@@ -304,7 +306,7 @@ def scan_once():
             last_alerts.add(key)
 
             save_signal(display_symbol, event["tf"], event["direction"], event["entry"],
-                        event["stop_loss"], event["target_1"], event["rr_ratio"])
+                        event["stop_loss"], event["target_1"], event["rr_ratio"], event["tp_eq"])
             telegram(format_signal(display_symbol, event, datetime.now(LOCAL_TZ).strftime("%H:%M:%S")))
             symbol_cooldown[display_symbol] = now
             time.sleep(0.2)

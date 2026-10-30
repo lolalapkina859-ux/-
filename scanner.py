@@ -1,4 +1,5 @@
 import os
+import time
 import logging
 from datetime import datetime, timezone
 
@@ -7,11 +8,17 @@ log = logging.getLogger("liquidity-hunter")
 # ==========================================
 # НАСТРОЙКИ (можно менять через Railway Variables)
 # ==========================================
-SL_ATR_MULT = float(os.getenv("SL_ATR_MULT", "0.4"))          # буфер стопа за уровнем = 0.4 * ATR(H4)
-MIN_RR = float(os.getenv("MIN_RR", "1.5"))                    # сигналы с RR ниже — не отправляются
-TP_MODE = os.getenv("TP_MODE", "range").strip().lower()       # "range" | "nearest"
-MAGNET_ATR_MULT = float(os.getenv("MAGNET_ATR_MULT", "1.0"))  # радиус HTF-магнита в ATR(H4)
-SWEEP_TOLERANCE = 0.0002                                      # допуск касания границы диапазона (0.02%)
+CRT_TF = os.getenv("CRT_TF", "1h").strip().lower()                # свеча-диапазон: "1h" | "4h"
+SL_ATR_MULT = float(os.getenv("SL_ATR_MULT", "0.5"))              # запас стопа за проколом = 0.5 * ATR(M5)
+ENTRY_RETRACE = float(os.getenv("ENTRY_RETRACE", "0.25"))         # вход: доля отката от уровня слома к экстремуму прокола (0 = ровно уровень слома)
+MIN_RR = float(os.getenv("MIN_RR", "1.5"))                        # RR до границы диапазона, ниже — сигнал не шлём
+MIN_RANGE_ATR = float(os.getenv("MIN_RANGE_ATR", "1.0"))          # свеча-диапазон >= k * ATR(CRT TF)
+MAX_SWEEP_ATR = float(os.getenv("MAX_SWEEP_ATR", "1.0"))          # прокол не глубже k * ATR(CRT TF), иначе это пробой, а не закол
+MIN_RISK_ATR = float(os.getenv("MIN_RISK_ATR", "1.5"))            # риск >= k * ATR(M5), иначе стоп слишком мал
+MAX_SIGNAL_AGE_BARS = int(os.getenv("MAX_SIGNAL_AGE_BARS", "6"))  # сигнал не старше N закрытых M5-свечей после слома
+
+TF_SECONDS = {"1h": 3600, "4h": 14400}
+M5 = 300
 
 
 # ==========================================
@@ -41,7 +48,7 @@ def fmt_price(p):
 
 
 # ==========================================
-# 2. DOL / ДИАПАЗОН / BIAS / QT
+# 2. DOL / ДИАПАЗОН / BIAS / QT  (для утренних отчётов)
 # ==========================================
 
 def calculate_dol_levels(d1_bars, w1_bars=None):
@@ -89,214 +96,201 @@ def calculate_daily_bias(d1_bars, h4_bars):
 
 
 # ==========================================
-# 3. ПУЛЫ ЛИКВИДНОСТИ (свинги H1/H4, PDH/PDL)
+# 3. CRT + TURTLE SOUP
+#    Свеча-диапазон (CRT_TF) -> прокол её хая/лоя -> возврат внутрь ->
+#    слом структуры на M5 -> вход лимиткой на откате
 # ==========================================
 
-def find_swing_pools(bars, left=2, right=2, lookback=60):
+def _flip(bars):
+    """Зеркалим цену (p -> -p), чтобы LONG считать той же логикой, что SHORT."""
+    return [{"timestamp": b["timestamp"], "open": -b["open"], "high": -b["low"],
+             "low": -b["high"], "close": -b["close"]} for b in bars]
+
+
+def _last_swing_low(m5, p, left=2, right=2, max_back=36):
+    """Последний фрактальный лой M5 перед экстремумом прокола p. Нет фрактала — минимум 6 свечей перед p."""
+    for i in range(p - right, max(left, p - max_back) - 1, -1):
+        lo = m5[i]["low"]
+        if all(lo < m5[j]["low"] for j in range(i - left, i)) and \
+           all(lo <= m5[j]["low"] for j in range(i + 1, i + right + 1)):
+            return i, lo
+    start = max(0, p - 6)
+    if p - start < 2:
+        return None
+    seg = m5[start:p]
+    k = min(range(len(seg)), key=lambda j: seg[j]["low"])
+    return start + k, seg[k]["low"]
+
+
+def _short_setup(rh, rl, m5, cur_start, now, atr5, atr_crt, symbol):
     """
-    Нетронутые (unswept) свинг-хаи и свинг-лоу — это и есть пулы ликвидности.
-    Свинг считается снятым, если любая более поздняя свеча зашла за него.
+    SHORT-логика в «прямых» координатах.
+    rh/rl — хай/лой свечи-диапазона, m5 — M5-свечи (последняя может быть ещё не закрыта).
+    Возвращает dict или None.
     """
-    if not bars or len(bars) < left + right + 1:
-        return [], []
-    start = max(left, len(bars) - lookback)
-    highs, lows = [], []
-    for i in range(start, len(bars) - right):
-        hi, lo = bars[i]["high"], bars[i]["low"]
-        left_bars = bars[i - left:i]
-        right_bars = bars[i + 1:i + 1 + right]
-        later = bars[i + 1:]
-        if all(hi > b["high"] for b in left_bars) and all(hi >= b["high"] for b in right_bars):
-            if max(b["high"] for b in later) <= hi:
-                highs.append(hi)
-        if all(lo < b["low"] for b in left_bars) and all(lo <= b["low"] for b in right_bars):
-            if min(b["low"] for b in later) >= lo:
-                lows.append(lo)
-    return highs, lows
-
-
-def collect_pools(h4_bars, h1_bars=None, d1_bars=None):
-    h4_hi, h4_lo = find_swing_pools(h4_bars, 2, 2, 60)
-    htf_highs = [(p, "H4 swing high") for p in h4_hi]
-    htf_lows = [(p, "H4 swing low") for p in h4_lo]
-
-    if d1_bars and len(d1_bars) >= 2:
-        pdh, pdl = d1_bars[-2]["high"], d1_bars[-2]["low"]
-        today = d1_bars[-1]
-        if today["high"] <= pdh:
-            htf_highs.append((pdh, "PDH"))
-        if today["low"] >= pdl:
-            htf_lows.append((pdl, "PDL"))
-
-    h1_highs, h1_lows = [], []
-    if h1_bars:
-        hi, lo = find_swing_pools(h1_bars, 3, 3, 72)
-        h1_highs = [(p, "H1 swing high") for p in hi]
-        h1_lows = [(p, "H1 swing low") for p in lo]
-
-    return {"htf_highs": htf_highs, "htf_lows": htf_lows,
-            "h1_highs": h1_highs, "h1_lows": h1_lows}
-
-
-def check_htf_liquidity_magnet(direction, level, atr, pools):
-    """
-    ФИЛЬТР СТАРШЕГО МАГНИТА (HTF DOL).
-    SHORT после снятия хая: если ВЫШЕ уровня закола лежит нетронутый HTF-пул
-    (H4 swing high / PDH) ближе MAGNET_ATR_MULT * ATR(H4) — цена, скорее всего,
-    тянется к нему, а стоп стоит прямо на пути. Сигнал блокируется.
-    LONG — зеркально по лоу.
-    Возвращает (ok, причина).
-    """
-    radius = atr * MAGNET_ATR_MULT
-    if direction == "SHORT":
-        above = [(p, lbl) for p, lbl in pools["htf_highs"] if p > level * (1 + SWEEP_TOLERANCE)]
-        if above:
-            p, lbl = min(above, key=lambda x: x[0])
-            if p - level <= radius:
-                return False, f"магнит сверху: {lbl} {fmt_price(p)}"
-    else:
-        below = [(p, lbl) for p, lbl in pools["htf_lows"] if p < level * (1 - SWEEP_TOLERANCE)]
-        if below:
-            p, lbl = max(below, key=lambda x: x[0])
-            if level - p <= radius:
-                return False, f"магнит снизу: {lbl} {fmt_price(p)}"
-    return True, None
-
-
-# ==========================================
-# 4. ВЫБОР ТЕЙКА
-# ==========================================
-
-def choose_target(direction, entry, risk, range_low, range_high, pools):
-    """
-    TP_MODE="range"   -> противоположная граница диапазона 24H (классика).
-    TP_MODE="nearest" -> ближайший нетронутый пул ликвидности (H1/H4 swing, PDH/PDL),
-                         дающий RR >= MIN_RR; если такого нет — граница диапазона.
-    Возвращает (tp, подпись, tp2).
-    """
-    if direction == "SHORT":
-        boundary = range_low if range_low < entry else None
-        cands = [(p, l) for p, l in pools["htf_lows"] + pools["h1_lows"] if p < entry]
-        cands.sort(key=lambda x: -x[0])      # ближайшие к цене первыми
-        label = "нижняя граница диапазона 24H"
-    else:
-        boundary = range_high if range_high > entry else None
-        cands = [(p, l) for p, l in pools["htf_highs"] + pools["h1_highs"] if p > entry]
-        cands.sort(key=lambda x: x[0])
-        label = "верхняя граница диапазона 24H"
-
-    if TP_MODE == "nearest":
-        for price, lbl in cands:
-            if abs(price - entry) / risk >= MIN_RR:
-                far = boundary if boundary is not None and (
-                    (direction == "SHORT" and boundary < price) or
-                    (direction == "LONG" and boundary > price)) else None
-                return price, lbl, far
-
-    if boundary is not None:
-        return boundary, label, None
-    return None, None, None
-
-
-# ==========================================
-# 5. ДЕТЕКТОР: SWEEP -> СТОП ЗА УРОВНЕМ -> ТЕЙК К ЛИКВИДНОСТИ
-# ==========================================
-
-def detect_macro_range_sweep(h4_bars, h1_bars, symbol="UNKNOWN", current_price=None, d1_bars=None):
-    if not h4_bars or len(h4_bars) < 20 or not h1_bars or len(h1_bars) < 24:
+    first = next((i for i, b in enumerate(m5) if b["timestamp"] >= cur_start), None)
+    if first is None or len(m5) - first < 3:
         return None
 
-    h4_curr = h4_bars[-1]
-    entry = current_price if current_price and current_price > 0 else h1_bars[-1]["close"]
-
-    rd = calculate_range_dynamics(h1_bars, window=24)
-    if not rd:
+    win = m5[first:]
+    peak = max(b["high"] for b in win)
+    if peak <= rh:
         return None
-    macro_high, macro_low, eq_level = rd["range_high"], rd["range_low"], rd["eq_level"]
-
-    if h4_curr["high"] >= macro_high * (1 - SWEEP_TOLERANCE):
-        direction, level = "SHORT", macro_high
-    elif h4_curr["low"] <= macro_low * (1 + SWEEP_TOLERANCE):
-        direction, level = "LONG", macro_low
-    else:
+    if peak - rh > MAX_SWEEP_ATR * atr_crt:
+        log.info(f"[{symbol}] прокол {peak - rh:.2f} глубже {MAX_SWEEP_ATR} ATR — это пробой, а не закол")
         return None
+    p = first + max(i for i, b in enumerate(win) if b["high"] == peak)  # последний экстремум
 
-    atr = calculate_atr(h4_bars, 14)
-    if atr <= 0:
-        atr = level * 0.003
-
-    pools = collect_pools(h4_bars, h1_bars, d1_bars)
-
-    ok, reason = check_htf_liquidity_magnet(direction, level, atr, pools)
-    if not ok:
-        log.info(f"🛡 [{symbol}] {direction} отфильтрован HTF-магнитом ({reason})")
+    sw = _last_swing_low(m5, p)
+    if sw is None:
         return None
+    _, sw_lvl = sw
 
-    # СТОП СТРОГО ЗА УРОВНЕМ ЗАКОЛА + буфер на ATR(H4)
-    buffer = atr * SL_ATR_MULT
-    if direction == "SHORT":
-        stop_loss = level + buffer
-        risk = stop_loss - entry
-    else:
-        stop_loss = level - buffer
-        risk = entry - stop_loss
-    if risk <= 0:
+    # слом структуры: ЗАКРЫТАЯ M5-свеча закрылась ниже последнего лоя перед проколом
+    mss = None
+    for i in range(p + 1, len(m5)):
+        b = m5[i]
+        if b["timestamp"] + M5 > now:   # свеча ещё формируется
+            break
+        if b["close"] < sw_lvl:
+            mss = i
+            break
+    if mss is None:
         return None
 
-    tp, tp_label, tp2 = choose_target(direction, entry, risk, macro_low, macro_high, pools)
-    if tp is None:
-        log.info(f"[{symbol}] нет цели с нужной стороны от входа — пропуск")
+    age_bars = (now - (m5[mss]["timestamp"] + M5)) / M5
+    if age_bars > MAX_SIGNAL_AGE_BARS:
         return None
 
-    rr = abs(tp - entry) / risk
+    leg = peak - sw_lvl
+    entry = sw_lvl + ENTRY_RETRACE * leg
+    sl = peak + SL_ATR_MULT * atr5
+    risk = sl - entry
+    tp_eq = (rh + rl) / 2.0
+    tp_main = rl
+    if risk <= 0 or not (tp_main < tp_eq < entry):
+        return None
+    if risk < MIN_RISK_ATR * atr5:
+        log.info(f"[{symbol}] стоп слишком мал ({risk:.2f} < {MIN_RISK_ATR} ATR M5) — пропуск")
+        return None
+    rr = (entry - tp_main) / risk
     if rr < MIN_RR:
-        log.info(f"[{symbol}] {direction}: RR {rr:.2f} < {MIN_RR} — пропуск")
+        log.info(f"[{symbol}] RR {rr:.2f} < {MIN_RR} — пропуск")
         return None
 
-    log.info(f"🚨 [{symbol}] SWEEP {direction} уровень {fmt_price(level)} RR {rr:.2f}")
+    after = m5[mss + 1:]
+    if any(b["high"] >= entry for b in after):
+        log.info(f"[{symbol}] откат в зону входа уже был — сигнал упущен")
+        return None
+    if any(b["low"] <= tp_eq for b in after):
+        log.info(f"[{symbol}] цена уже дошла до EQ — сигнал упущен")
+        return None
 
     return {
-        "setup_type": "PRICE_ACTION_SWEEP",
-        "direction": direction,
-        "tf": "1H / 4H Price Action",
-        "level": level,
-        "eq_level": eq_level,
-        "daily_bias": calculate_daily_bias(d1_bars, h4_bars) if d1_bars else "NEUTRAL",
-        "qt_phase": get_quarterly_phase(),
-        "entry": entry,
-        "stop_loss": stop_loss,
-        "target_1": tp,
-        "target_2": tp2,
-        "tp_label": tp_label,
-        "rr_ratio": round(rr, 2),
-        "atr_h4": atr,
-        "bar_time": h4_curr["timestamp"],
+        "entry": entry, "stop_loss": sl, "tp_eq": tp_eq, "target": tp_main,
+        "rr": rr, "rr_eq": (entry - tp_eq) / risk, "sweep_extreme": peak,
+        "mss_level": sw_lvl, "mss_ts": m5[mss]["timestamp"],
     }
 
 
-def detect_sweep(d1_bars, h4_bars, h1_bars, symbol="UNKNOWN", current_price=None):
-    return detect_macro_range_sweep(h4_bars, h1_bars, symbol, current_price, d1_bars)
+def detect_crt_setup(crt_bars, m5_bars, symbol="UNKNOWN", now=None):
+    """
+    1) Свеча-диапазон = последняя ЗАКРЫТАЯ свеча CRT_TF, мы находимся внутри следующей.
+    2) В текущей свече цена проколола хай ИЛИ лой диапазона (не оба).
+    3) На M5 закрытием сломан последний свинг перед проколом (возврат внутрь диапазона).
+    4) Лимитный вход на откате, SL за экстремумом прокола, цели: EQ и противоположная граница.
+    """
+    now = time.time() if now is None else now
+    period = TF_SECONDS.get(CRT_TF, 3600)
+    if not crt_bars or not m5_bars or len(m5_bars) < 60:
+        return None
+
+    closed = [b for b in crt_bars if b["timestamp"] + period <= now]
+    if len(closed) < 16:
+        return None
+    rng = closed[-1]
+    cur_start = rng["timestamp"] + period
+    if not (cur_start <= now < cur_start + period):
+        return None   # рынок закрыт / нет текущей свечи
+
+    atr_crt = calculate_atr(closed, 14)
+    m5 = sorted(m5_bars, key=lambda b: b["timestamp"])
+    m5_closed = [b for b in m5 if b["timestamp"] + M5 <= now]
+    atr5 = calculate_atr(m5_closed, 14)
+    if atr_crt <= 0 or atr5 <= 0:
+        return None
+
+    rh, rl = rng["high"], rng["low"]
+    if (rh - rl) < MIN_RANGE_ATR * atr_crt:
+        return None
+
+    cur = [b for b in m5 if b["timestamp"] >= cur_start]
+    if not cur:
+        return None
+    swept_hi = max(b["high"] for b in cur) > rh
+    swept_lo = min(b["low"] for b in cur) < rl
+    if swept_hi == swept_lo:   # ничего не проколото либо проколоты обе стороны
+        return None
+
+    if swept_hi:
+        direction = "SHORT"
+        res = _short_setup(rh, rl, m5, cur_start, now, atr5, atr_crt, symbol)
+    else:
+        direction = "LONG"
+        r = _short_setup(-rl, -rh, _flip(m5), cur_start, now, atr5, atr_crt, symbol)
+        res = None
+        if r:
+            res = {"entry": -r["entry"], "stop_loss": -r["stop_loss"], "tp_eq": -r["tp_eq"],
+                   "target": -r["target"], "rr": r["rr"], "rr_eq": r["rr_eq"],
+                   "sweep_extreme": -r["sweep_extreme"], "mss_level": -r["mss_level"],
+                   "mss_ts": r["mss_ts"]}
+    if not res:
+        return None
+
+    zone_a, zone_b = sorted((res["mss_level"], res["entry"]))
+    log.info(f"🚨 [{symbol}] CRT {direction}: вход {fmt_price(res['entry'])} SL {fmt_price(res['stop_loss'])} RR {res['rr']:.2f}")
+
+    return {
+        "setup_type": "CRT_TURTLE_SOUP",
+        "direction": direction,
+        "tf": f"CRT {CRT_TF.upper()} / M5",
+        "crt_high": rh,
+        "crt_low": rl,
+        "eq_level": res["tp_eq"],
+        "sweep_extreme": res["sweep_extreme"],
+        "mss_level": res["mss_level"],
+        "zone": (zone_a, zone_b),
+        "entry": res["entry"],
+        "stop_loss": res["stop_loss"],
+        "tp_eq": res["tp_eq"],
+        "target_1": res["target"],      # главная цель = противоположная граница диапазона (по ней считается результат)
+        "rr_ratio": round(res["rr"], 2),
+        "rr_eq": round(res["rr_eq"], 2),
+        "atr_m5": atr5,
+        "daily_bias": "—",
+        "qt_phase": get_quarterly_phase(),
+        "bar_time": rng["timestamp"],   # одна свеча-диапазон + одно направление = один сигнал
+    }
 
 
 # ==========================================
-# 6. ФОРМАТ СООБЩЕНИЯ
+# 4. ФОРМАТ СООБЩЕНИЯ
 # ==========================================
 
 def format_signal(symbol, event, time_str=""):
+    arrow = "📉" if event["direction"] == "SHORT" else "📈"
+    side = "SELL" if event["direction"] == "SHORT" else "BUY"
+    z1, z2 = event["zone"]
     msg = (
-        f"🚨 **PRICE ACTION SIGNAL: {symbol}** 🚨\n\n"
-        f"📈 Направление: `{event['direction']}`\n"
-        f"🎯 Триггер: Снятие ликвидности диапазона 24H (H1/H4)\n"
-        f"📍 Уровень закола: `{fmt_price(event['level'])}`\n"
-        f"💵 Цена входа: `{fmt_price(event['entry'])}`\n"
-        f"🛡 Стоп-Лосс (SL): `{fmt_price(event['stop_loss'])}` (за уровнем + {SL_ATR_MULT} ATR H4)\n"
-        f"🎯 Тейк-Профит (TP): `{fmt_price(event['target_1'])}` ({event['tp_label']})\n"
-    )
-    if event.get("target_2") is not None:
-        msg += f"🚀 TP2: `{fmt_price(event['target_2'])}` (граница диапазона)\n"
-    msg += (
-        f"⚖️ RR: `1:{event['rr_ratio']}`\n"
-        f"📅 Bias: `{event['daily_bias']}` | ⌛ QT: `{event['qt_phase']}`\n"
+        f"{arrow} **{symbol} {side} LIMIT** (CRT + Turtle Soup)\n\n"
+        f"🕯 Свеча-диапазон {CRT_TF.upper()}: `{fmt_price(event['crt_low'])}` – `{fmt_price(event['crt_high'])}`\n"
+        f"🪤 Прокол (Ts): `{fmt_price(event['sweep_extreme'])}`\n"
+        f"🔄 Слом структуры M5 (M'): `{fmt_price(event['mss_level'])}`\n\n"
+        f"📍 Вход лимиткой: `{fmt_price(event['entry'])}` (зона `{fmt_price(z1)}`–`{fmt_price(z2)}`)\n"
+        f"🛡 SL: `{fmt_price(event['stop_loss'])}` (за проколом + {SL_ATR_MULT} ATR M5)\n"
+        f"✔️ TP1 (EQ): `{fmt_price(event['tp_eq'])}` (1:{event['rr_eq']})\n"
+        f"🎯 TP2 (граница диапазона): `{fmt_price(event['target_1'])}` (1:{event['rr_ratio']})\n\n"
+        f"⚠️ Ордер отложенный: если цена не вернётся в зону входа, сетап отменяется.\n"
     )
     if time_str:
         msg += f"⏱ Время: {time_str}"
