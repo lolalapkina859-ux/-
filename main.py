@@ -41,7 +41,7 @@ SYMBOLS = {
     "BTC / USDT": {"source": "bingx", "ticker": "BTC-USDT"},
     "ETH / USDT": {"source": "bingx", "ticker": "ETH-USDT"},
     "SOL / USDT": {"source": "bingx", "ticker": "SOL-USDT"},
-    "XAU / USD": {"source": "yfinance", "ticker": os.getenv("GOLD_TICKER", "XAUUSD=X")},
+    "XAU / USD": {"source": "yfinance", "ticker": "XAUT-USD"},
     "XAG / USD": {"source": "yfinance", "ticker": "SI=F"},
     "USOIL / USD": {"source": "yfinance", "ticker": "CL=F"},
     "US500 / USD": {"source": "yfinance", "ticker": "SPY"},
