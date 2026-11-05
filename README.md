@@ -1,31 +1,78 @@
-# Liquidity Hunter FX — H4/H1 Sweep / M5 CHoCH / HTF SL-TP
+# Trade Vision 24/7 — Liquidity Signal Bot
 
-Telegram alert bot deployed as a Railway worker. It does not place orders.
+Railway-ready Python scanner for Bybit perpetual markets.
 
-## Signal logic
-1. Detects confirmed sweeps on **both H4 and H1**. H1 checks the preceding 24 closed H1 candles; H4 checks the preceding 20 closed H4 candles.
-2. A sweep is confirmed only when the candle trades beyond the prior range and closes back inside. The H4 detector currently checks the latest fully closed H4 candle because M5 history is limited by the current data feed.
-3. Waits for a **closed M5 candle** to break a confirmed local structure pivot in the sweep direction (CHoCH). M5 is the entry-confirmation timeframe for both H1 and H4 sweeps.
-4. If an H1 sweep occurs inside the same H4 sweep candle in the same direction, the alert is labeled **H4 + H1** and requires M5 confirmation after H4 closes.
-5. Entry is the close of the M5 confirmation candle.
-6. SL is calculated from the selected sweep wick extreme plus a small volatility-based buffer; M5 swings never define the stop.
-7. TP is selected from confirmed H1/H4 liquidity (with daily levels as context); M5 swings never define the target.
-8. SL buffer = volatility buffer + configurable per-symbol spread reserve. Spread reserve is added beyond the selected H1 or H4 sweep wick, and RR is recalculated after the adjustment.
-9. The minimum 1R filter remains. HTF bias is contextual: countertrend signals are allowed only after the selected H1/H4 Sweep and M5 CHoCH confirm the chosen DOL direction.
+## Logic v1
 
-## Setup / Railway
-Required variables:
-- `TELEGRAM_BOT_TOKEN`
-- `TELEGRAM_CHAT_ID`
-- Optional: `SCAN_INTERVAL_SECONDS` (defaults to 60)
+The bot uses:
 
-Install requirements and run `python main.py`, or deploy as a Railway worker using the existing `Procfile`.
+- 4H context
+- 15M confirmation
+- PDH / PDL
+- PWH / PWL
+- PMH / PML
+- previous swing high / low
+- Asia / London / New York ranges
+- liquidity sweep detection
+- WaveTrend 9 / 12 / 3
+- extreme level ±60
+- Money Flow 21 / 9
+- 15M structure shift
+- dynamic Entry / SL / TP levels
+- Telegram signal score
 
-## Important limitations
-- Market data still comes from BingX for crypto and Yahoo Finance for other instruments. These feeds do not provide the live FxPro bid/ask spread used by this bot; spread reserves are configurable estimates, not live broker spread measurements. Tune them to your FxPro account and symbol specifications. These quotes may differ from the broker's CFD prices; especially note that `XAUT-USD` is not the same instrument as a broker's `XAUUSD` CFD.
-- Yahoo Finance 4H bars are aggregated from 1H bars and may not align perfectly with broker session boundaries.
-- The HTF bias is intentionally a simple directional filter, not a complete discretionary ICT/SMC model. H4 and H1 signals are not proof of profitability; compare their outcomes separately in alert logs.
-- TP selection is algorithmic: the nearest qualifying pivot/PDH/PDL can be a weak liquidity level. Validate chart-by-chart before using live.
-- Tracker still evaluates outcomes from fetched H1 highs/lows, so if SL and TP are both touched within the same H1 candle, intrabar order cannot be known from these bars. Such outcomes should be reviewed manually.
-- The algorithm is not backtested or guaranteed profitable. Start with alerts only and verify signals against the exact broker chart.
-- Never commit `.env` or API tokens to GitHub.
+The WaveTrend and Money Flow formulas are ported from the supplied Liquidity Tracker Pine logic.
+
+## Railway
+
+1. Push this folder to GitHub.
+2. Create a new Railway project from the GitHub repo.
+3. Add Variables:
+
+```env
+TELEGRAM_BOT_TOKEN=...
+TELEGRAM_CHAT_ID=...
+WATCHED_SYMBOLS=BTCUSDT,ETHUSDT,HYPEUSDT,FARTCOINUSDT,ZAMAUSDT
+MIN_SIGNAL_SCORE=70
+SCAN_INTERVAL_SECONDS=60
+```
+
+4. Railway should detect the Procfile and run:
+
+```bash
+python main.py
+```
+
+## Important
+
+Version 1 is **signal-only**. It does not place trades.
+
+That is intentional: first compare Telegram calls against manual chart analysis and tune the score/entry logic before enabling execution.
+
+## Recommended next upgrades
+
+- exact equal-high / equal-low engine from the Pine script
+- explicit sweep vs liquidity-run state machine
+- bullish/bearish divergence engine
+- half-timeframe Money Flow
+- FVG detection and 50% FVG entries
+- persistent database instead of JSON state
+- chart snapshot attached to Telegram
+- optional Bybit execution module after validation
+
+## Trend Trader M5 (multi-asset signal-only mode)
+
+The Railway `Procfile` runs `trend_trader_main.py`. This mode scans a fixed 10-symbol universe:
+
+- BTCUSDT, ETHUSDT, SOLUSDT — Bybit linear perpetual market candles
+- XAUUSD — Yahoo Finance `GC=F` (COMEX gold futures proxy)
+- XAGUSD — Yahoo Finance `SI=F` (COMEX silver futures proxy)
+- USOIL — Yahoo Finance `CL=F` (WTI crude futures proxy)
+- US500 — Yahoo Finance `ES=F` (E-mini S&P 500 futures proxy)
+- EURUSD, GBPUSD, USDJPY — Yahoo Finance FX reference candles
+
+Signal logic follows the supplied Smart Signal Pro v2 Trend Trader preset: ATR period 10, sensitivity 10, closed M5 candle crossover. Levels: TP1 0.5%, TP2 1.0%, TP3 1.5%, SL 1.0%; TP4 is removed. This mode only sends Telegram alerts and does not place orders.
+
+Railway Variables required: `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`. Optional: `SCAN_INTERVAL_SECONDS` (default 60).
+
+**Data-source limitation:** Yahoo Finance futures/FX symbols are reference-data proxies, not guaranteed to match a broker's XAUUSD/XAGUSD/USOIL/US500/FX CFD feed. Validate prices and symbol sessions against the broker before using alerts for live decisions. Crypto is sourced from Bybit, not BingX. The previous liquidity-engine modules remain in the repository but are not used by this Trend Trader M5 entry point.

@@ -1,1 +1,1 @@
-worker: python main.py
+worker: python trend_trader_main.py
