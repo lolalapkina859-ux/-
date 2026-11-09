@@ -2,6 +2,7 @@ import json, os, time, threading
 from pathlib import Path
 from datetime import datetime, timezone
 import requests
+import multi_asset_data
 from multi_asset_data import INSTRUMENTS, get_m5
 from trend_trader import get_signal
 from qml_scanner import QMLScanner
@@ -32,24 +33,33 @@ def send(text):
 def fmt(x): return f'{x:.5f}' if abs(x)<100 else f'{x:.2f}'
 
 
+def fetch_dataframe_for_tf(symbol, tf):
+    """
+    Универсальное получение свечей по таймфрейму из multi_asset_data.
+    Ищет поддерживаемые функции get_klines, get_ohlc, get_tf или fallback на get_m5.
+    """
+    if hasattr(multi_asset_data, 'get_klines'):
+        return multi_asset_data.get_klines(symbol, tf)
+    elif hasattr(multi_asset_data, 'get_data'):
+        return multi_asset_data.get_data(symbol, tf)
+    elif hasattr(multi_asset_data, 'get_ohlc'):
+        return multi_asset_data.get_ohlc(symbol, tf)
+    elif tf in ["5m", "m5"]:
+        return get_m5(symbol)
+    return None
+
+
 def run_qml_thread():
     """Отдельный поток для QML-сканера (не затрагивает Trend Trader)"""
     print('=== TRADE VISION 24/7 | QML FTB SCANNER STARTED ===')
     qml_state = load_state(QML_STATE_FILE)
     scanner = QMLScanner(zigzag_len=9)
-    
-    # Пытаемся импортировать функцию загрузки таймфреймов, либо fallback на get_m5
-    try:
-        from multi_asset_data import get_klines
-    except ImportError:
-        def get_klines(symbol, tf):
-            return get_m5(symbol) if tf in ["5m", "m5"] else None
 
     while True:
         for symbol in INSTRUMENTS:
             for tf in TIMEFRAMES:
                 try:
-                    df = get_klines(symbol, tf)
+                    df = fetch_dataframe_for_tf(symbol, tf)
                     if df is None or df.empty:
                         continue
                     

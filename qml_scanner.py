@@ -46,7 +46,7 @@ class QMLScanner:
         if len(swings) < 6:
             return signals
 
-        # Проходим по последним свингам для поиска паттернов QML
+        # Проходим по всем доступным связкам свингов
         for i in range(len(swings) - 5):
             s5, s4, s3, s2, s1, s0 = swings[i:i+6]
             atr_val = df['atr'].iloc[s3['index']] if not np.isnan(df['atr'].iloc[s3['index']]) else df['atr'].iloc[-1]
@@ -83,7 +83,6 @@ class QMLScanner:
                         current_price = df['close'].iloc[-1]
                         current_low = df['low'].iloc[-1]
                         
-                        # Режим Both (BOS + FTB): фиксируем сигнал либо при пробое, либо при касании зоны QML
                         is_near_zone = current_low <= qml_level + (atr_val * 0.2)
                         
                         signals.append({
