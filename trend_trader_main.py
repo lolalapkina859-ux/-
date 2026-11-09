@@ -62,23 +62,16 @@ def run_qml_thread():
                         emoji = "🟢" if "BULLISH" in sig['type'] else "🔴"
                         status_tag = "FTB Touch" if sig['is_ftb_touch'] else "Structure BOS Break"
                         
-                        msg = (f"📊 TRADE VISION 24/7 — QML FTB SIGNAL
-
-"
-                               f"Инструмент: {symbol}
-"
-                               f"Таймфрейм: {tf}
-"
-                               f"Паттерн: {emoji} {sig['type']}
-"
-                               f"Зона QML: {fmt(sig['level'])}
-"
-                               f"Текущая цена: {fmt(sig['price'])}
-"
-                               f"Статус: {status_tag}
-
-"
-                               f"⚠️ Сигнал информационный.")
+                        msg = (
+                            f"📊 TRADE VISION 24/7 — QML FTB SIGNAL\n\n"
+                            f"Инструмент: {symbol}\n"
+                            f"Таймфрейм: {tf}\n"
+                            f"Паттерн: {emoji} {sig['type']}\n"
+                            f"Зона QML: {fmt(sig['level'])}\n"
+                            f"Текущая цена: {fmt(sig['price'])}\n"
+                            f"Статус: {status_tag}\n\n"
+                            f"⚠️ Сигнал информационный."
+                        )
                         
                         send(msg)
                         qml_state[key] = time.time()
@@ -113,24 +106,19 @@ def run():
                 if state.get(symbol)==key:
                     print(f'{symbol}: duplicate skipped')
                     continue
-                msg=(f"📊 TRADE VISION 24/7 — TREND TRADER M5
-
-"
-                     f"Инструмент: {symbol}
-Направление: {'🟢 BUY' if sig['side']=='BUY' else '🔴 SELL'}
-"
-                     f"Entry: {fmt(sig['entry'])}
-SL: {fmt(sig['sl'])}
-"
-                     f"TP1 (0.5%): {fmt(sig['tps'][0])}
-TP2 (1.0%): {fmt(sig['tps'][1])}
-TP3 (1.5%): {fmt(sig['tps'][2])}
-"
-                     f"Smart Trail: {fmt(sig['trail'])}
-Свеча M5 закрылась: {sig['candle_time']}
-
-"
-                     f"⚠️ Сигнал информационный. Источник котировок может отличаться от цены твоего брокера.")
+                msg=(
+                    f"📊 TRADE VISION 24/7 — TREND TRADER M5\n\n"
+                    f"Инструмент: {symbol}\n"
+                    f"Направление: {'🟢 BUY' if sig['side']=='BUY' else '🔴 SELL'}\n"
+                    f"Entry: {fmt(sig['entry'])}\n"
+                    f"SL: {fmt(sig['sl'])}\n"
+                    f"TP1 (0.5%): {fmt(sig['tps'][0])}\n"
+                    f"TP2 (1.0%): {fmt(sig['tps'][1])}\n"
+                    f"TP3 (1.5%): {fmt(sig['tps'][2])}\n"
+                    f"Smart Trail: {fmt(sig['trail'])}\n"
+                    f"Свеча M5 закрылась: {sig['candle_time']}\n\n"
+                    f"⚠️ Сигнал информационный. Источник котировок может отличаться от цены твоего брокера."
+                )
                 send(msg); state[symbol]=key; save_state(STATE_FILE, state)
                 print(f'{symbol}: {sig["side"]} sent')
             except Exception as e:
